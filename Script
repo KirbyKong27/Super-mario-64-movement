@@ -20,6 +20,25 @@ local IDLE_VARIANT_DELAY = 6 -- seconds standing still before an idle variant pl
 -- Head camera mode (persists across respawns): 0 off, 1 emoting only, 2 not emoting, 3 always
 local HeadCam = { mode = 0 }
 
+-- Collision scan: classifies every BasePart under workspace (parts, meshes, unions,
+-- and anything nested in models or folders). Your own character is skipped.
+local function scanWorkspaceCollision()
+	local char = plr.Character
+	local collidable, uncollidable, list = 0, 0, {}
+	for _, d in ipairs(workspace:GetDescendants()) do
+		if d:IsA("BasePart") and not (char and d:IsDescendantOf(char)) then
+			if d.CanCollide then
+				collidable += 1
+			else
+				uncollidable += 1
+				table.insert(list, d:GetFullName())
+			end
+		end
+	end
+	table.sort(list)
+	return { collidable = collidable, uncollidable = uncollidable, list = list }
+end
+
 -- globalConns live for the whole script; charConns are cleared on every respawn
 local globalConns = {}
 local charConns = {}
@@ -2021,6 +2040,48 @@ do
 		end)
 	end
 	refreshHeadCam()
+
+	-- Collision scan UI
+	local csLabel = ins("TextLabel")
+	csLabel.Size = ud2(1, 0, 0, 22)
+	csLabel.BackgroundTransparency = 1
+	csLabel.Text = "Collision Scan"
+	csLabel.TextColor3 = c3(0, 200, 255)
+	csLabel.Font = Enum.Font.GothamBold
+	csLabel.TextSize = 14
+	csLabel.TextXAlignment = Enum.TextXAlignment.Left
+	csLabel.Parent = stContent
+
+	local csInfo = ins("TextLabel")
+	csInfo.Size = ud2(1, 0, 0, 30)
+	csInfo.BackgroundTransparency = 1
+	csInfo.Text = "Not scanned yet"
+	csInfo.TextColor3 = c3(220, 220, 220)
+	csInfo.Font = Enum.Font.Gotham
+	csInfo.TextSize = 12
+	csInfo.TextWrapped = true
+	csInfo.TextXAlignment = Enum.TextXAlignment.Left
+	csInfo.Parent = stContent
+
+	local csBtn = ins("TextButton")
+	csBtn.Size = ud2(1, 0, 0, 34)
+	csBtn.BackgroundColor3 = c3(40, 80, 60)
+	csBtn.Text = "Scan Workspace"
+	csBtn.TextColor3 = c3(255, 255, 255)
+	csBtn.Font = Enum.Font.GothamBold
+	csBtn.TextSize = 12
+	csBtn.Parent = stContent
+	corner(csBtn, 4)
+
+	local function runCollisionScan()
+		local r = scanWorkspaceCollision()
+		csInfo.Text = string.format("Collidable: %d | Uncollidable: %d (list printed to output)", r.collidable, r.uncollidable)
+		print(string.format("[Collision Scan] %d collidable, %d uncollidable", r.collidable, r.uncollidable))
+		for i = 1, math.min(#r.list, 300) do print("  [uncollidable] " .. r.list[i]) end
+		if #r.list > 300 then print("  ...and " .. (#r.list - 300) .. " more") end
+	end
+	csBtn.MouseButton1Click:Connect(runCollisionScan)
+	runCollisionScan()
 
 	stfReset.MouseButton1Click:Connect(function()
 		for key, val in pairs(SettingsDefaults) do
