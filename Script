@@ -1,0 +1,2117 @@
+--[[ STANDALONE PARKOUR SCRIPT - R15 ONLY - RESPAWN SAFE ]]
+
+-- Re-running the script shuts down the previous instance first
+if getgenv().ParkourShutdown then pcall(getgenv().ParkourShutdown) end
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local ContextActionService = game:GetService("ContextActionService")
+local PhysicsService = game:GetService("PhysicsService")
+
+local plr = Players.LocalPlayer
+local ins, c3, ud2, v2 = Instance.new, Color3.fromRGB, UDim2.new, Vector2.new
+local isMobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+local JUMP_SOUND = "rbxasset://sounds/action_jump.mp3"
+local LAND_SOUND = "rbxasset://sounds/action_jump_land.mp3"
+local IDLE_VARIANT_DELAY = 6 -- seconds standing still before an idle variant plays
+
+-- Head camera mode (persists across respawns): 0 off, 1 emoting only, 2 not emoting, 3 always
+local HeadCam = { mode = 0 }
+
+-- globalConns live for the whole script; charConns are cleared on every respawn
+local globalConns = {}
+local charConns = {}
+local function track(c) table.insert(charConns, c) return c end
+local function gconn(c) table.insert(globalConns, c) return c end
+
+-- Shared UI handles (assigned later)
+local sg, mobileGui, stopE
+
+--==================================================================--
+--// STATE //--
+--==================================================================--
+
+local AbilityVars = {
+	Diving = false, DiveSlideCanceling = false, DiveSliding = false, Crouching = false,
+	LongJumping = false, diveCount = 0, totalDives = 0, cananimate = true,
+	GroundPounding = false, backflipping = false, canGroundPound = true, hitfloor = false,
+	DiveSpeed = 0, Trail = nil, canDive = true, char = nil, Emoting = false,
+	MovingEmote = false, Gen = 0,
+}
+
+local Settings = {
+	BaseWalkSpeed = 13, MaxSlopeSpeed = 35, MinSlopeSpeed = 25, BaseJumpPower = 50, MaxSlopeAngle = 50,
+	RegularJumpHeight = 50, DoubleJumpHeight = 75, TripleJumpHeight = 95, JumpWalkSpeedBonusDivisor = 4,
+	DiveForwardMultiplier = 2, DiveUpwardBoost = 50, DiveSlideDeceleration = 1,
+	DiveSlideStartPenalty = 15, DiveSlideDownforce = -5,
+	SlideCancelUpForce = 40, SlideCancelBackMultiplier = 1.5,
+	LongJumpWalkSpeed = 25, LongJumpUpForce = 50, LongJumpForwardMultiplier = 2, LongJumpLandWalkSpeed = 34,
+	BackflipUpForce = 95, BackflipBackForce = 12,
+	GroundPoundChargeTime = 0.5, GroundPoundSlamSpeed = -75, GroundPoundRecoveryTime = 0.2,
+	CrouchWalkSpeed = 5,
+	WallGripDuration = 1, WallJumpCooldown = 0.1, WallJumpUpForce = 55, WallJumpPushForce = 50,
+	SlopeSpeedGainRate = 0.2, SlopeSpeedLossRate = 0.2, SlopeDiveSlideGainRate = 4, SlopeDiveSlideLossRate = 1,
+	WalkAccelRate = 0.6, WalkDecelRate = 0.1,
+}
+
+local States = { state = "Default" }
+function States:ChangeState(s) self.state = s end
+function States:GetState() return self.state end
+
+local Sounds = {}
+function Sounds.PlaySound(parent, id, volume, pitch)
+	pcall(function()
+		local sound = ins("Sound", parent:FindFirstChild("HumanoidRootPart"))
+		sound.Volume = volume
+		sound.Pitch = pitch
+		sound.SoundId = id
+		sound:Play()
+		game:GetService("Debris"):AddItem(sound, sound.TimeLength)
+	end)
+end
+
+--==================================================================--
+--// EFFECTS //--
+--==================================================================--
+
+local Effects = {}
+local tweenInfo = TweenInfo.new(0.2, Enum.EasingStyle.Linear, Enum.EasingDirection.Out, 0, false, 0)
+
+local function createDustPart()
+	local dust = ins("Part")
+	dust.Name = "Dust"
+	dust.Shape = Enum.PartType.Ball
+	dust.Size = Vector3.new(0.69, 0.69, 0.69)
+	dust.Color = Color3.new(1, 1, 1)
+	dust.CanCollide = false
+	dust.TopSurface = Enum.SurfaceType.Smooth
+	dust.BottomSurface = Enum.SurfaceType.Smooth
+	dust.Transparency = 0
+	dust.Material = Enum.Material.Neon
+	return dust
+end
+
+local function fadeAndDestroy(part)
+	local tw = TweenService:Create(part, tweenInfo, {Size = Vector3.new(0, 0, 0), Transparency = 1})
+	tw:Play()
+	tw.Completed:Connect(function(state)
+		if state == Enum.PlaybackState.Completed then pcall(function() part:Destroy() end) end
+	end)
+end
+
+function Effects.Dust()
+	local char = AbilityVars.char
+	if not char or not char:FindFirstChild("HumanoidRootPart") then return end
+	local d = createDustPart()
+	d.Parent = char:FindFirstChild("GFX") or char
+	d.CFrame = char.HumanoidRootPart.CFrame - Vector3.new(0, 2.8, 0)
+	fadeAndDestroy(d)
+end
+
+function Effects.WalljumpDust()
+	local char = AbilityVars.char
+	if not char or not char:FindFirstChild("HumanoidRootPart") then return end
+	local root = char.HumanoidRootPart
+	local d = createDustPart()
+	d.Parent = char:FindFirstChild("GFX") or char
+	local _, point = workspace:FindPartOnRay(Ray.new(root.Position, root.CFrame.LookVector * -1.5), char)
+	if point then d.Position = point else d.CFrame = root.CFrame end
+	fadeAndDestroy(d)
+end
+
+function Effects.LandEffect(_, radius, number)
+	local char = AbilityVars.char
+	if not char or not char:FindFirstChild("HumanoidRootPart") then return end
+	local root = char.HumanoidRootPart
+	local gfx = char:FindFirstChild("GFX") or char
+	for i = 1, number do
+		local angle = (math.pi * 2) / number * i
+		local p = createDustPart()
+		p.Parent = gfx
+		p.Anchored = true
+		p.Position = Vector3.new(root.Position.X + math.cos(angle) * radius, root.Position.Y - 2.5, root.Position.Z + math.sin(angle) * radius)
+		fadeAndDestroy(p)
+	end
+end
+
+--==================================================================--
+--// ANIMATION LIBRARIES //--
+--==================================================================--
+
+local AbilityAnims = {
+	DiveAnim = nil, LongJumpAnim = nil, DiveSAnim = nil, WallJumpAnim = nil,
+	CrouchAnim = nil, GroundPoundAnim = nil, GroundPoundStartA = nil, RollAnim = nil,
+}
+
+local ABILITY_ANIM_MAP = {
+	Dive = "DiveAnim", Longjump = "LongJumpAnim", DiveSlide = "DiveSAnim", WallJump = "WallJumpAnim",
+	Crouch = "CrouchAnim", GroundPoundS = "GroundPoundStartA", GroundPound = "GroundPoundAnim", Roll = "RollAnim",
+}
+
+function AbilityAnims:PlayAnimation(name)
+	local key = ABILITY_ANIM_MAP[name]
+	local anim = key and self[key]
+	if anim then pcall(function() anim:Play() end) end
+end
+
+function AbilityAnims:StopAnimation(name)
+	local key = ABILITY_ANIM_MAP[name]
+	local anim = key and self[key]
+	if anim then pcall(function() anim:Stop() end) end
+end
+
+-- Fixed ability animations (crouch is selectable, see CrouchAnimations)
+local R15_Animations = {
+	Longjump = "rbxassetid://14181783061",
+	GroundPoundS = "rbxassetid://114751541427034",
+	GroundPound = "rbxassetid://84689831662753",
+	DoubleJump = "rbxassetid://115201271656995",
+	TripleJump = "rbxassetid://14145234694",
+	DiveS = "rbxassetid://100998966618362",
+	Backflip = "rbxassetid://88302645471896",
+}
+
+-- Each type table maps a name to an asset id. Packs appear in each type they have
+-- animations for, so mix & match still works.
+local IdleAnimations = {
+	Default = "rbxassetid://107767882862142", Cool = "rbxassetid://98485460652889",
+	Honored = "rbxassetid://91833267843461", Retro = "rbxassetid://91929470847088",
+	Sk8r = "rbxassetid://97445280417226", Scared = "rbxassetid://120879126406241",
+	Jolly = "rbxassetid://89394075596712", Speedster = "rbxassetid://106408632597748",
+	SpeedsterR6 = "rbxassetid://137888559242342", SpeedRunner = "rbxassetid://100926924175638",
+	Survivor = "rbxassetid://76668955826653",
+	["Modernized R6"] = "rbxassetid://119203531445156",
+	SRBG = "rbxassetid://116463335076260",
+	HedgeHog = "rbxassetid://125320031368092",
+	Silver = "rbxassetid://72904612350762",
+	Shadow = "rbxassetid://105489916610475",
+}
+
+-- Idle variants: only idles listed here have a variant. Plays after standing still for IDLE_VARIANT_DELAY.
+local IdleVariants = {
+	Retro = "rbxassetid://133779289795398",
+	Scared = "rbxassetid://90962592517596",
+	SpeedsterR6 = "rbxassetid://138572111742301",
+	Survivor = "rbxassetid://103608205797687",
+	["Modernized R6"] = "rbxassetid://119203531445156",
+	HedgeHog = "rbxassetid://109947546069456",
+	Silver = "rbxassetid://105835520333040",
+	Shadow = "rbxassetid://137216043101721",
+}
+
+local PACK_ORDER = {
+	"Default", "Cool", "Honored", "Retro", "Sk8r", "Scared", "Jolly", "Speedster", "SpeedsterR6", "SpeedRunner",
+	"Survivor", "Modernized R6", "SRBG", "HedgeHog", "Silver", "Shadow",
+}
+local IdleOrder = PACK_ORDER
+
+local RunAnimations = {
+	Default = "rbxassetid://129096653543782", Cool = "rbxassetid://121063851088879",
+	Honored = "rbxassetid://125582828675515", Retro = "rbxassetid://139330487152019",
+	Sk8r = "rbxassetid://105810339804399", Scared = "rbxassetid://94292858675799",
+	Jolly = "rbxassetid://124419804298310", Speedster = "rbxassetid://118321428692216",
+	SpeedsterR6 = "rbxassetid://136286582256431", SpeedRunner = "rbxassetid://139491217245146",
+	Survivor = "rbxassetid://103091973161069",
+	["Modernized R6"] = "rbxassetid://74875055236295",
+	SRBG = "rbxassetid://74525523253851",
+	HedgeHog = "rbxassetid://81054817148662",
+	Silver = "rbxassetid://111566787066876",
+	Shadow = "rbxassetid://135577109534379",
+}
+local RunOrder = PACK_ORDER
+
+local JumpAnimations = {
+	Default = "rbxassetid://76570630008633", Cool = "rbxassetid://131467045077224",
+	Honored = "rbxassetid://126302440229906", Retro = "rbxassetid://100750527588373",
+	Sk8r = "rbxassetid://115201271656995", Scared = "rbxassetid://111147456573108",
+	Jolly = "rbxassetid://122115816220842", Speedster = "rbxassetid://83127400103635",
+	SpeedsterR6 = "rbxassetid://103611122518815", SpeedRunner = "rbxassetid://87115550283700",
+	Survivor = "rbxassetid://125772394585171",
+	["Modernized R6"] = "rbxassetid://95904619428650",
+	SRBG = "rbxassetid://106908172650920",
+	HedgeHog = "rbxassetid://96664791129351",
+	Silver = "rbxassetid://86605439692320",
+	Shadow = "rbxassetid://103442270940820",
+}
+local JumpOrder = PACK_ORDER
+
+local FallAnimations = {
+	Default = "rbxassetid://119190893282260", Cool = "rbxassetid://135694727101792",
+	Honored = "rbxassetid://90046220955251", Retro = "rbxassetid://124757226129715",
+	Sk8r = "rbxassetid://116266944496059", Scared = "rbxassetid://118828218865394",
+	Jolly = "rbxassetid://85263802503331", Speedster = "rbxassetid://87165706871925",
+	SpeedsterR6 = "rbxassetid://116687380855697", SpeedRunner = "rbxassetid://134654484403325",
+	Survivor = "rbxassetid://113767290702894",
+	["Modernized R6"] = "rbxassetid://134676097974115",
+	SRBG = "rbxassetid://70523433372199",
+	HedgeHog = "rbxassetid://117566681472574",
+	Silver = "rbxassetid://120975375638647",
+	Shadow = "rbxassetid://109321117031592",
+}
+local FallOrder = PACK_ORDER
+
+local CrouchAnimations = {
+	Default = "rbxassetid://139538459949202",
+	Ninja = "rbxassetid://110275663504820",
+	["Two Time"] = "rbxassetid://105035775376167",
+}
+local CrouchOrder = {"Default", "Ninja", "Two Time"}
+
+local WallSlideAnimations = {
+	Default = "rbxassetid://98136062574793", Chill = "rbxassetid://117205468700578",
+	Spider = "rbxassetid://120600221860610", Aura = "rbxassetid://85326579132263",
+	Tweaking = "rbxassetid://110991969895751", SpeedsterR6 = "rbxassetid://116687380855697",
+}
+local WallSlideOrder = {"Default", "Chill", "Spider", "Aura", "Tweaking", "SpeedsterR6"}
+
+local DiveAnimations = {
+	Default = "rbxassetid://132624199623293", Roll = "rbxassetid://100998966618362",
+	Dash = "rbxassetid://77053251062908", ["Annoying Fly"] = "rbxassetid://71062658341883",
+	Reaching = "rbxassetid://91705781577408",
+}
+local DiveOrder = {"Default", "Roll", "Dash", "Annoying Fly", "Reaching"}
+
+local AnimLibs = {
+	Idle = IdleAnimations, Run = RunAnimations, Jump = JumpAnimations, Fall = FallAnimations,
+	Crouch = CrouchAnimations, WallSlide = WallSlideAnimations, Dive = DiveAnimations,
+}
+
+local SelectedAnimations = {
+	Idle = "Default", Run = "Default", Jump = "Default", Fall = "Default",
+	Crouch = "Default", WallSlide = "Default", Dive = "Default",
+}
+
+-- Per-character state. Cur.anims holds the tracks for the current character.
+local Cur = { char = nil, hum = nil, root = nil, animator = nil, anims = {}, session = nil, ctl = nil, variantEnd = nil, idleStill = nil }
+local EmoteState = { ca = nil, thread = nil, timer = nil, variation = nil }
+
+local function loadAnim(animator, id)
+	local anim = ins("Animation")
+	anim.AnimationId = id
+	return animator:LoadAnimation(anim)
+end
+
+-- Ends an idle variant early (or when it finishes) and resets its timer
+local function stopIdleVariant()
+	Cur.variantEnd = nil
+	Cur.idleStill = nil
+	local v = Cur.anims and Cur.anims.IdleVariant
+	if v then pcall(function() v:Stop(0.25) end) end
+end
+
+local function reloadSelected(kind)
+	local h, A = Cur.animator, Cur.anims
+	if not h or not A.Idle then return end
+	local function rep(key, id)
+		if not id then return end
+		local was = A[key] and A[key].IsPlaying
+		if A[key] then pcall(function() A[key]:Stop(0) end) end
+		A[key] = loadAnim(h, id)
+		if was then A[key]:Play() end
+	end
+
+	if kind == "Idle" then
+		stopIdleVariant()
+		rep("Idle", IdleAnimations[SelectedAnimations.Idle])
+		if A.IdleVariant then pcall(function() A.IdleVariant:Stop(0) end) end
+		local vid = IdleVariants[SelectedAnimations.Idle]
+		A.IdleVariant = vid and loadAnim(h, vid) or nil
+		if A.IdleVariant then A.IdleVariant.Looped = true end
+	elseif kind == "Run" then
+		rep("Walk", RunAnimations[SelectedAnimations.Run])
+	elseif kind == "Jump" then
+		local id = JumpAnimations[SelectedAnimations.Jump]
+		rep("Jump1", id)
+		rep("Jump2", id)
+	elseif kind == "Fall" then
+		rep("Fall", FallAnimations[SelectedAnimations.Fall])
+	elseif kind == "Crouch" then
+		rep("Crouch", CrouchAnimations[SelectedAnimations.Crouch])
+		AbilityAnims.CrouchAnim = A.Crouch
+	elseif kind == "WallSlide" then
+		rep("WallJump", WallSlideAnimations[SelectedAnimations.WallSlide])
+		AbilityAnims.WallJumpAnim = A.WallJump
+	elseif kind == "Dive" then
+		rep("Dive", DiveAnimations[SelectedAnimations.Dive])
+		AbilityAnims.DiveAnim = A.Dive
+	end
+end
+
+local function applyAnim(kind, name)
+	local lib = AnimLibs[kind]
+	if not lib or not lib[name] then return end
+	SelectedAnimations[kind] = name
+	reloadSelected(kind)
+end
+
+--==================================================================--
+--// ABILITIES //--
+--==================================================================--
+
+local function resetAbilityFlags()
+	AbilityVars.Diving = false
+	AbilityVars.DiveSliding = false
+	AbilityVars.DiveSlideCanceling = false
+	AbilityVars.LongJumping = false
+	AbilityVars.Crouching = false
+	AbilityVars.GroundPounding = false
+	AbilityVars.backflipping = false
+	AbilityVars.canGroundPound = true
+	AbilityVars.hitfloor = false
+	AbilityVars.DiveSpeed = 0
+	AbilityVars.canDive = true
+	AbilityVars.Emoting = false
+	AbilityVars.MovingEmote = false
+	AbilityVars.cananimate = true
+end
+
+local lastDiveTime = 0
+local function Dive_Ability()
+	pcall(function()
+		if AbilityVars.Emoting or AbilityVars.Diving then return end
+		if tick() - lastDiveTime < 0.1 then return end
+		lastDiveTime = tick()
+		local char = AbilityVars.char
+		local humanoid = char and char:FindFirstChild("Humanoid")
+		local rootpart = char and char:FindFirstChild("HumanoidRootPart")
+		if not humanoid or not rootpart then return end
+
+		AbilityVars.LongJumping = false
+		AbilityVars.canDive = false
+		AbilityVars.Diving = true
+
+		local running = rootpart:FindFirstChild("Running")
+		if running then running.Volume = 0 end
+		if AbilityVars.Trail then AbilityVars.Trail.Enabled = true end
+
+		for _, track in ipairs(humanoid:GetPlayingAnimationTracks()) do track:Stop() end
+
+		AbilityVars.cananimate = false
+		AbilityVars.diveCount += 1
+		AbilityVars.totalDives += 1
+		AbilityAnims:PlayAnimation("Dive")
+
+		humanoid:ChangeState(Enum.HumanoidStateType.Flying)
+		rootpart.Velocity = rootpart.CFrame.LookVector * humanoid.WalkSpeed * Settings.DiveForwardMultiplier + Vector3.new(0, Settings.DiveUpwardBoost, 0)
+		AbilityVars.DiveSpeed = rootpart.Velocity.Y
+		rootpart.RotVelocity = rootpart.CFrame:VectorToWorldSpace(Vector3.new(-math.rad(100), 0, 0))
+
+		Sounds.PlaySound(char, JUMP_SOUND, 3, 1.5)
+
+		local currentDive = AbilityVars.totalDives
+		task.wait(0.5)
+		if currentDive == AbilityVars.totalDives then rootpart.RotVelocity = Vector3.zero end
+	end)
+end
+
+local function DiveSlide_Ability()
+	pcall(function()
+		local char = AbilityVars.char
+		local humanoid = char and char:FindFirstChild("Humanoid")
+		local rootpart = char and char:FindFirstChild("HumanoidRootPart")
+		if not humanoid or not rootpart then return end
+		local gen = AbilityVars.Gen
+
+		AbilityVars.DiveSpeed = AbilityVars.DiveSpeed - Settings.DiveSlideStartPenalty
+		AbilityVars.canDive = false
+
+		for _, track in ipairs(humanoid:GetPlayingAnimationTracks()) do track:Stop() end
+
+		if AbilityVars.Trail then AbilityVars.Trail.Enabled = false end
+		AbilityAnims:PlayAnimation("DiveSlide")
+		AbilityVars.cananimate = false
+
+		local vel = ins("BodyVelocity")
+		vel.MaxForce = Vector3.new(math.huge, 0, math.huge)
+		vel.Velocity = Vector3.new(0, Settings.DiveSlideDownforce, 0)
+		vel.Parent = rootpart
+
+		humanoid.MaxSlopeAngle = 1
+
+		local running = rootpart:FindFirstChild("Running")
+		if running then running.Volume = 0 end
+
+		AbilityVars.DiveSliding = true
+
+		while AbilityVars.DiveSpeed > 0 and AbilityVars.Gen == gen do
+			task.wait()
+			vel.Velocity = rootpart.CFrame.LookVector * AbilityVars.DiveSpeed
+			AbilityVars.DiveSpeed = AbilityVars.DiveSpeed - Settings.DiveSlideDeceleration
+			humanoid.JumpPower = 0
+		end
+
+		AbilityVars.canDive = true
+		AbilityVars.DiveSliding = false
+		AbilityAnims:StopAnimation("DiveSlide")
+		if running then running.Volume = 1 end
+		AbilityVars.cananimate = true
+		vel:Destroy()
+
+		humanoid.JumpPower = Settings.BaseJumpPower
+		humanoid.MaxSlopeAngle = Settings.MaxSlopeAngle
+	end)
+end
+
+local function CancelSlide_Ability()
+	pcall(function()
+		if AbilityVars.Emoting then return end
+		local char = AbilityVars.char
+		local humanoid = char and char:FindFirstChild("Humanoid")
+		local rootpart = char and char:FindFirstChild("HumanoidRootPart")
+		if not humanoid or not rootpart then return end
+
+		AbilityVars.cananimate = false
+		AbilityVars.DiveSlideCanceling = true
+		humanoid:ChangeState(Enum.HumanoidStateType.Flying)
+		rootpart.RotVelocity = Vector3.zero
+		rootpart.Velocity = rootpart.CFrame:VectorToWorldSpace(Vector3.new(0, Settings.SlideCancelUpForce, -humanoid.WalkSpeed * Settings.SlideCancelBackMultiplier))
+
+		Sounds.PlaySound(char, JUMP_SOUND, 3, 2.5)
+		AbilityAnims:PlayAnimation("Roll")
+
+		local running = rootpart:FindFirstChild("Running")
+		if running then running.Volume = 0 end
+
+		AbilityVars.DiveSpeed = 0
+		AbilityVars.DiveSliding = false
+		if AbilityVars.Trail then AbilityVars.Trail.Enabled = false end
+
+		for _, v in ipairs(rootpart:GetChildren()) do
+			if v:IsA("BodyVelocity") then v:Destroy() end
+		end
+
+		AbilityAnims:StopAnimation("DiveSlide")
+		humanoid.JumpPower = Settings.BaseJumpPower
+		humanoid.MaxSlopeAngle = 60
+	end)
+end
+
+local function LongJump_Ability()
+	pcall(function()
+		if AbilityVars.Emoting then return end
+		local char = AbilityVars.char
+		local humanoid = char and char:FindFirstChild("Humanoid")
+		local rootpart = char and char:FindFirstChild("HumanoidRootPart")
+		if not humanoid or not rootpart then return end
+
+		AbilityVars.Crouching = false
+		AbilityVars.LongJumping = true
+
+		local running = rootpart:FindFirstChild("Running")
+		if running then running.Volume = 0 end
+
+		humanoid.Jump = true
+		humanoid:ChangeState(Enum.HumanoidStateType.Flying)
+		humanoid.WalkSpeed = Settings.LongJumpWalkSpeed
+		rootpart.RotVelocity = Vector3.zero
+		if AbilityVars.Trail then AbilityVars.Trail.Enabled = true end
+
+		rootpart.Velocity = rootpart.CFrame:VectorToWorldSpace(Vector3.new(0, Settings.LongJumpUpForce, -humanoid.WalkSpeed * Settings.LongJumpForwardMultiplier))
+
+		Sounds.PlaySound(char, JUMP_SOUND, 3, 1.5)
+		AbilityVars.cananimate = false
+
+		for _, track in ipairs(humanoid:GetPlayingAnimationTracks()) do track:Stop() end
+		AbilityAnims:PlayAnimation("Longjump")
+	end)
+end
+
+local function Backflip_Ability()
+	pcall(function()
+		if AbilityVars.Emoting then return end
+		local char = AbilityVars.char
+		local humanoid = char and char:FindFirstChild("Humanoid")
+		local rootpart = char and char:FindFirstChild("HumanoidRootPart")
+		if not humanoid or not rootpart then return end
+
+		AbilityVars.Crouching = false
+		humanoid:ChangeState(Enum.HumanoidStateType.Flying)
+		rootpart.RotVelocity = Vector3.zero
+		rootpart.Velocity = rootpart.CFrame:VectorToWorldSpace(Vector3.new(0, Settings.BackflipUpForce, Settings.BackflipBackForce))
+		AbilityVars.cananimate = true
+		AbilityVars.backflipping = true
+
+		Sounds.PlaySound(char, JUMP_SOUND, 3, 2.5)
+	end)
+end
+
+local function GroundPound_Ability()
+	pcall(function()
+		if AbilityVars.Emoting then return end
+		local char = AbilityVars.char
+		local humanoid = char and char:FindFirstChild("Humanoid")
+		local rootpart = char and char:FindFirstChild("HumanoidRootPart")
+		if not humanoid or not rootpart then return end
+		local gen = AbilityVars.Gen
+
+		humanoid.WalkSpeed = 0
+		AbilityVars.LongJumping = false
+		AbilityVars.GroundPounding = true
+		AbilityVars.backflipping = false
+		AbilityVars.canGroundPound = false
+		AbilityVars.cananimate = false
+		AbilityVars.hitfloor = false
+		AbilityVars.Crouching = false
+
+		for _, track in ipairs(humanoid:GetPlayingAnimationTracks()) do track:Stop() end
+
+		humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+		AbilityAnims:PlayAnimation("GroundPoundS")
+		Sounds.PlaySound(char, JUMP_SOUND, 3, 1.5)
+
+		local vel = ins("BodyVelocity", rootpart)
+		vel.Velocity = Vector3.zero
+		vel.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+		vel.Name = "GroundPoundVelocity"
+
+		task.wait(Settings.GroundPoundChargeTime)
+		if AbilityVars.Gen ~= gen then vel:Destroy() return end
+
+		if AbilityVars.Trail then AbilityVars.Trail.Enabled = true end
+		vel.Velocity = rootpart.CFrame.UpVector * Settings.GroundPoundSlamSpeed
+		AbilityAnims:StopAnimation("GroundPoundS")
+		AbilityAnims:PlayAnimation("GroundPound")
+
+		repeat task.wait() until AbilityVars.hitfloor or AbilityVars.Gen ~= gen
+
+		if AbilityVars.Trail then AbilityVars.Trail.Enabled = false end
+		AbilityVars.canGroundPound = true
+		AbilityAnims:StopAnimation("GroundPound")
+		vel:Destroy()
+		AbilityVars.hitfloor = false
+		AbilityVars.GroundPounding = false
+		AbilityVars.cananimate = true
+
+		local hitfloorGP = char:FindFirstChild("HitfloorGP")
+		if hitfloorGP then hitfloorGP.Value = true end
+		task.wait(Settings.GroundPoundRecoveryTime)
+		if hitfloorGP then hitfloorGP.Value = false end
+	end)
+end
+
+--==================================================================--
+--// EMOTES (imported from Forsaken script) //--
+--==================================================================--
+
+local V = {
+	conga = {"rbxassetid://117506341081827", "rbxassetid://110955034311554", "rbxassetid://126452924444711"},
+	schaden = {"rbxassetid://77737003924429", "rbxassetid://98252592747900", "rbxassetid://114126194173005", "rbxassetid://135922494842143"},
+	car = {"rbxassetid://72382226286301", "rbxassetid://76503595759461", "rbxassetid://76961871758278", "rbxassetid://89256675888646", "rbxassetid://95123756079525"},
+	pose = {"rbxassetid://93810591156861", "rbxassetid://93106139772346", "rbxassetid://129148098440909", "rbxassetid://107112780597236", "rbxassetid://130276846339108", "rbxassetid://116505117247744", "rbxassetid://93507119848388", "rbxassetid://137985052211397"},
+	mii = {"rbxassetid://138807649249562", "rbxassetid://139287529330820"},
+	tv = {"rbxassetid://77984841414450", "rbxassetid://115605836623904"},
+	edance = {"rbxassetid://89676212115777", "rbxassetid://116571017721759", "rbxassetid://78240649545370", "rbxassetid://91867154217166"},
+	lets = {"rbxassetid://95585866234915", "rbxassetid://94275453368628"},
+	sit = {"rbxassetid://124147048813016", "rbxassetid://110267215709658", "rbxassetid://76380058413667", "rbxassetid://125264302028325", "rbxassetid://71928524581848", "rbxassetid://95825103583419", "rbxassetid://135428534495602"},
+	wall = {"rbxassetid://106394178681320", "rbxassetid://109023823632297", "rbxassetid://136841080936511", "rbxassetid://110520509803491"},
+}
+
+-- Entry format: {name, id, variations, interval, speed, mode}
+-- mode: "still" (default), "car" (moves, swaps variations), "slow" (Griddy), "bhop" (B-hop)
+local EMOTES = {
+	{"California Girls", "rbxassetid://76389296606994"},
+	{"Conga!", "rbxassetid://126452924444711", V.conga, 5, nil, "car"},
+	{"Schadenfreude", nil, V.schaden, 4},
+	{"Junky Dance", "rbxassetid://86814544467194"},
+	{"So Retro", "rbxassetid://104134515632649"},
+	{"Jersey Club", "rbxassetid://74594994292329"},
+	{"Smug Dance", "rbxassetid://121934635382614"},
+	{"Assumptions", "rbxassetid://113285790404555"},
+	{"Grizzly", "rbxassetid://107009143041355"},
+	{"Angels of Delusions", "rbxassetid://99893613768286"},
+	{"I JUST HIT THE JACKPOT!!!", "rbxassetid://85510114879662"},
+	{"Clown Dance", "rbxassetid://138755180984581"},
+	{"Blue Shirt Sturdy", "rbxassetid://76892786020048"},
+	{"Gangnam Style", "rbxassetid://118644064755644"},
+	{"Sturdy", "rbxassetid://119641433612039"},
+	{"AVGN", "rbxassetid://73556554187770"},
+	{"Tomodachi", "rbxassetid://86377688970477"},
+	{"Bounce Dance", "rbxassetid://111272262660539"},
+	{"ShowAdo", "rbxassetid://118305787208808"},
+	{"CryBall", "rbxassetid://132365556028541"},
+	{"BANG", "rbxassetid://87267348984534"},
+	{"Scuba Cat", "rbxassetid://80954025062546"},
+	{"Springtrap Sturdy", "rbxassetid://117503161941626"},
+	{"Invincible Wobble", "rbxassetid://111808196256227"},
+	{"Party Rock", "rbxassetid://134459607456762"},
+	{"CatGirl Sit", "rbxassetid://89546868891758"},
+	{"Dancing With Your Eyes Closed", "rbxassetid://117991470645633"},
+	{"Hoppin Dip", "rbxassetid://83245110677797"},
+	{"Alter Ego", "rbxassetid://79384504031917"},
+	{"Bag Up", "rbxassetid://88570432473654"},
+	{"Metro Man", "rbxassetid://93998638971828"},
+	{"Subject Three", "rbxassetid://111993447655346"},
+	{"Caramelldansen", "rbxassetid://102908521825429"},
+	{"Unemployment", "rbxassetid://87033513223989"},
+	{"Dance Potion", "rbxassetid://129385001500617"},
+	{"I CAME TO GROOVE!", "rbxassetid://122707447789732", nil, nil, 1.2},
+	{"Self Paced", "rbxassetid://76168776374710"},
+	{"Miss Me?", "rbxassetid://80297412981245", nil, nil, 1.12},
+	{"OneyPlayz", "rbxassetid://104693685027668", nil, nil, 1.3},
+	{"Yuta Jumping", "rbxassetid://105576523362700"},
+	{"Dead Man Standing", "rbxassetid://94299283574571"},
+	{"Squingle", "rbxassetid://137421579830901"},
+	{"Addendum", "rbxassetid://121924019901219", nil, nil, 2},
+	{"Boogie Down", "rbxassetid://105261207855400"},
+	{"Naoya Party", "rbxassetid://111778103423130"},
+	{"Sit", nil, V.sit, 4},
+	{"Wall Lean", nil, V.wall, 5},
+	{"Jamal Dance", "rbxassetid://127823207582392"},
+	{"Flare", "rbxassetid://91414599614401"},
+	{"PBJ", "rbxassetid://115764349136416"},
+	{"BirdBrain", "rbxassetid://123471454475978"},
+	{"Wave", "rbxassetid://83988109664343"},
+	{"Beckon", "rbxassetid://105788999573245"},
+	{"Dap-Up", "rbxassetid://74839406256285"},
+	{"Orange Justice", "rbxassetid://81292195847151"},
+	{"Pop-Lock", "rbxassetid://109351092282275"},
+	{"MY WORLD", "rbxassetid://118710904417046"},
+	{"Take The L", "rbxassetid://100598839310833"},
+	{"Default Dance", "rbxassetid://107266862552760"},
+	{"ShowTime Swing", "rbxassetid://105825005569685"},
+	{"MegaPhone", "rbxassetid://131166373115033"},
+	{"Parker Pride", "rbxassetid://107943246605367"},
+	{"Prince of Egypt", "rbxassetid://133669151185294"},
+	{"Body Phone", "rbxassetid://73390669780316"},
+	{"Rambunctious", "rbxassetid://81224135177975"},
+	{"Dance If You Carried", "rbxassetid://85924918188334"},
+	{"Hype", "rbxassetid://72075855775185"},
+	{"Luxe Step", "rbxassetid://72458847650460"},
+	{"Pop Data Thang", "rbxassetid://78107551057927"},
+	{"Worm", "rbxassetid://89593072932752"},
+	{"Electro Shuffle", "rbxassetid://115722479400858"},
+	{"Billy Bounce", "rbxassetid://128807957040123"},
+	{"Tuff Dance", "rbxassetid://102327672016629"},
+	{"Heel Hop", "rbxassetid://100416508747167"},
+	{"Split Dance", "rbxassetid://134222816689544"},
+	{"Basketball Head", "rbxassetid://138243322520289"},
+	{"Popular Vibe", "rbxassetid://93062298566806"},
+	{"Peace Sign", "rbxassetid://115262232732736"},
+	{"Car", nil, V.car, 4, nil, "car"},
+	{"Pose", nil, V.pose, 4},
+	{"Cry", "rbxassetid://133541780143791"},
+	{"B-hop", "rbxassetid://134484705368874", nil, nil, 1.8, "bhop"},
+	{"Confess Your Love", "rbxassetid://83490449557215"},
+	{"Garry's Dance", "rbxassetid://111555607376454"},
+	{"Physco Teddy", "rbxassetid://79508052726697"},
+	{"Mannrobics", "rbxassetid://99805408085488"},
+	{"Boppin", "rbxassetid://118800950867852"},
+	{"DAI DAI DAI", "rbxassetid://94718844464478"},
+	{"Melee Flourish", "rbxassetid://104771812454967"},
+	{"Aim Test", "rbxassetid://84470135668108"},
+	{"Wait!", "rbxassetid://105005183316218"},
+	{"Fireball", "rbxassetid://102593046003485"},
+	{"Foreign Shuffle", "rbxassetid://81217869654335"},
+	{"I See Kareem Groove", "rbxassetid://81912794236530"},
+	{"Groove Out", "rbxassetid://108748954547905"},
+	{"Mii Street Dance", nil, V.mii, 4},
+	{"Cory Dance", "rbxassetid://95114672949685"},
+	{"Street Guy Fighting", "rbxassetid://133864899504878"},
+	{"Sherbet Lobby", "rbxassetid://117518902080633"},
+	{"TV Time", nil, V.tv, 4},
+	{"P.Y.T", "rbxassetid://108374677470972"},
+	{"My Life is a Party", "rbxassetid://111475375762344"},
+	{"Jumpstyle", "rbxassetid://126588201825176"},
+	{"Buggin", "rbxassetid://131507580963734"},
+	{"Torture Dance", "rbxassetid://100784037937970"},
+	{"Griddy", "rbxassetid://89683244530713", nil, nil, nil, "slow"},
+	{"Late Night Shuffle", "rbxassetid://127744968066540"},
+	{"Piku Dance", "rbxassetid://121530643689363"},
+	{"Trip Out", "rbxassetid://139805351843019"},
+	{"Fazbear Dance", "rbxassetid://90395099017767"},
+	{"Monito Ring", "rbxassetid://119818376516492"},
+	{"It's Like I'm Not Here", "rbxassetid://130731157770034", nil, nil, 1.2},
+	{"In Ha Mood", "rbxassetid://105892486621561"},
+	{"Rat Dance", "rbxassetid://79878714311433"},
+	{"Four Lokos", "rbxassetid://117420775806036"},
+	{"Otsukare Summer", "rbxassetid://102662583709770"},
+	{"Lethal Dance", "rbxassetid://114408299255221"},
+	{"Get Jiggy", "rbxassetid://95553508202355"},
+	{"Aura Monster", "rbxassetid://91039645890556"},
+	{"Blue Top Rock", "rbxassetid://79304757249067"},
+	{"Shuffling", "rbxassetid://118468821959324"},
+	{"Tiki Dance", "rbxassetid://94593831004144"},
+	{"Oshi No Ko", "rbxassetid://104814587445643"},
+	{"MII Cheering", "rbxassetid://140122299835469"},
+	{"Fact Attack", "rbxassetid://74770054214962"},
+	{"/e Dance", nil, V.edance, 4},
+	{"Snoop Dance", "rbxassetid://107759404982778"},
+	{"Rakai", "rbxassetid://116624474530947"},
+	{"Hamster Dance", "rbxassetid://138667496817464"},
+	{"Maji", "rbxassetid://85679985671598"},
+	{"Call My Name", "rbxassetid://104848080410945"},
+	{"Work To The Beat", "rbxassetid://107687316148408"},
+	{"Lets Groove", nil, V.lets, 4},
+	{"Lord Verity", "rbxassetid://138590353960942"},
+	{"Dynamic Shuffle", "rbxassetid://95766159476079"},
+	{"Starting Prance", "rbxassetid://116168139592282"},
+	{"Reese Roll", "rbxassetid://77632933361810"},
+	{"BloodPop", "rbxassetid://132419286132659"},
+}
+
+local function stopParkourTracks()
+	local h = Cur.hum
+	if not h then return end
+	for _, t in ipairs(h:GetPlayingAnimationTracks()) do
+		if t ~= EmoteState.ca then
+			pcall(function() t:Stop(0.15) end)
+		end
+	end
+end
+
+local function clearEmote()
+	if EmoteState.ca then pcall(function() EmoteState.ca:Stop(0.25) end) end
+	EmoteState.ca = nil
+	if EmoteState.thread then task.cancel(EmoteState.thread) EmoteState.thread = nil end
+	if EmoteState.timer then task.cancel(EmoteState.timer) EmoteState.timer = nil end
+	EmoteState.variation = nil
+	AbilityVars.Emoting = false
+	AbilityVars.MovingEmote = false
+	AbilityVars.cananimate = true
+	if stopE then stopE.Visible = false end
+	if Cur.hum then Cur.hum.WalkSpeed = Settings.BaseWalkSpeed end
+end
+
+local function playEmote(entry)
+	local a, h = Cur.animator, Cur.hum
+	if not a or not h then return end
+	clearEmote()
+	stopIdleVariant()
+	stopParkourTracks()
+
+	local id, vars, interval, speed, mode = entry[2], entry[3], entry[4], entry[5], entry[6] or "still"
+	local emoteId = id
+	if vars and #vars > 0 then emoteId = vars[math.random(1, #vars)] end
+
+	AbilityVars.Emoting = true
+	AbilityVars.cananimate = false
+
+	local t = loadAnim(a, emoteId)
+	t.Looped = true
+	t.Priority = Enum.AnimationPriority.Action3
+	EmoteState.ca = t
+
+	if mode == "car" then
+		AbilityVars.MovingEmote = true
+		h.WalkSpeed = 8
+		EmoteState.variation = emoteId
+		EmoteState.timer = task.spawn(function()
+			while EmoteState.ca and EmoteState.ca.IsPlaying and vars do
+				task.wait(interval or 4)
+				local cur = EmoteState.ca
+				if not cur or not cur.IsPlaying then break end
+				local newId = vars[math.random(1, #vars)]
+				if newId ~= EmoteState.variation then
+					local nt = loadAnim(a, newId)
+					nt.Looped = true
+					nt.Priority = Enum.AnimationPriority.Action3
+					nt:Play(0.25)
+					cur:Stop(0.25)
+					EmoteState.ca = nt
+					EmoteState.variation = newId
+				end
+			end
+		end)
+	elseif mode == "slow" then
+		AbilityVars.MovingEmote = true
+		h.WalkSpeed = 2.5
+	elseif mode == "bhop" then
+		AbilityVars.MovingEmote = true
+		h.WalkSpeed = 17
+	else
+		h.WalkSpeed = 0
+	end
+
+	t:Play(0.25)
+	if speed then t:AdjustSpeed(speed) end
+	stopE.Visible = true
+
+	EmoteState.thread = task.spawn(function()
+		while EmoteState.ca and EmoteState.ca.IsPlaying do
+			stopParkourTracks()
+			task.wait(0.1)
+		end
+	end)
+end
+
+--==================================================================--
+--// PER-CHARACTER SETUP //--
+--==================================================================--
+
+local function ctl(name)
+	local c = Cur.ctl
+	if c and c[name] then c[name]() end
+end
+
+local function cleanupCharacter()
+	if Cur.session then Cur.session.alive = false end
+	for _, c in ipairs(charConns) do pcall(function() c:Disconnect() end) end
+	table.clear(charConns)
+	pcall(clearEmote)
+	pcall(function() ContextActionService:UnbindAction("Dive") end)
+	if AbilityVars.Trail then
+		pcall(function() AbilityVars.Trail:Destroy() end)
+		AbilityVars.Trail = nil
+	end
+	EmoteState.ca = nil
+	Cur.ctl, Cur.hum, Cur.animator, Cur.char, Cur.root = nil, nil, nil, nil, nil
+	Cur.variantEnd, Cur.idleStill = nil, nil
+	Cur.anims = {}
+	AbilityVars.char = nil
+end
+
+local function setupCharacter(newChar)
+	cleanupCharacter()
+
+	local session = { alive = true }
+	Cur.session = session
+	AbilityVars.Gen += 1
+	resetAbilityFlags()
+
+	local char = newChar
+	local hum = char:WaitForChild("Humanoid")
+	local rootpart = char:WaitForChild("HumanoidRootPart")
+	local animator = hum:WaitForChild("Animator")
+	local lowerTorso = char:WaitForChild("LowerTorso")
+	if Cur.session ~= session then return end
+
+	Cur.char, Cur.hum, Cur.root, Cur.animator = char, hum, rootpart, animator
+	AbilityVars.char = char
+
+	local A = {}
+	Cur.anims = A
+
+	hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+	hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+	hum:SetStateEnabled(Enum.HumanoidStateType.Climbing, false)
+	hum.MaxSlopeAngle = Settings.MaxSlopeAngle
+
+	-- Ability animations
+	A.LongJump = loadAnim(animator, R15_Animations.Longjump)
+	A.GroundPound = loadAnim(animator, R15_Animations.GroundPound)
+	A.GroundPoundS = loadAnim(animator, R15_Animations.GroundPoundS)
+	A.DoubleJump = loadAnim(animator, R15_Animations.DoubleJump)
+	A.TripleJump = loadAnim(animator, R15_Animations.TripleJump)
+	A.DiveS = loadAnim(animator, R15_Animations.DiveS)
+	A.Backflip = loadAnim(animator, R15_Animations.Backflip)
+
+	-- Selected (mix & match) animations, preserved across respawns
+	A.Crouch = loadAnim(animator, CrouchAnimations[SelectedAnimations.Crouch])
+	A.Idle = loadAnim(animator, IdleAnimations[SelectedAnimations.Idle])
+	local variantId = IdleVariants[SelectedAnimations.Idle]
+	A.IdleVariant = variantId and loadAnim(animator, variantId) or nil
+	if A.IdleVariant then A.IdleVariant.Looped = true end
+	A.Walk = loadAnim(animator, RunAnimations[SelectedAnimations.Run])
+	A.Fall = loadAnim(animator, FallAnimations[SelectedAnimations.Fall])
+	A.Jump1 = loadAnim(animator, JumpAnimations[SelectedAnimations.Jump])
+	A.Jump2 = loadAnim(animator, JumpAnimations[SelectedAnimations.Jump])
+	A.WallJump = loadAnim(animator, WallSlideAnimations[SelectedAnimations.WallSlide])
+	A.Dive = loadAnim(animator, DiveAnimations[SelectedAnimations.Dive])
+
+	AbilityAnims.DiveAnim = A.Dive
+	AbilityAnims.LongJumpAnim = A.LongJump
+	AbilityAnims.DiveSAnim = A.DiveS
+	AbilityAnims.WallJumpAnim = A.WallJump
+	AbilityAnims.CrouchAnim = A.Crouch
+	AbilityAnims.GroundPoundAnim = A.GroundPound
+	AbilityAnims.GroundPoundStartA = A.GroundPoundS
+	AbilityAnims.RollAnim = A.TripleJump
+
+	-- Trail
+	local att0 = ins("Attachment")
+	att0.Name = "Trail0"
+	att0.CFrame = CFrame.new(0, 0, 0)
+	att0.Parent = lowerTorso
+	local att1 = ins("Attachment")
+	att1.Name = "Trail1"
+	att1.CFrame = CFrame.new(0, rootpart.Size.Y / 2, 0)
+	att1.Parent = lowerTorso
+	local trail = ins("Trail")
+	trail.Name = "AirTrail"
+	trail.Attachment0 = att0
+	trail.Attachment1 = att1
+	trail.FaceCamera = false
+	trail.TextureMode = Enum.TextureMode.Stretch
+	trail.MinLength = 0
+	trail.Lifetime = 0.2
+	trail.Color = ColorSequence.new(Color3.new(1, 1, 1))
+	trail.Transparency = NumberSequence.new(0)
+	trail.Parent = char
+	AbilityVars.Trail = trail
+
+	-- Kill default Animate script (and any re-added copy)
+	local animate = char:FindFirstChild("Animate")
+	if animate then animate:Destroy() end
+	track(char.ChildAdded:Connect(function(c)
+		if c.Name == "Animate" then task.defer(c.Destroy, c) end
+	end))
+	for _, t in ipairs(hum:GetPlayingAnimationTracks()) do t:Stop() end
+
+	-- Anti-fling
+	for _, v in ipairs(char:GetDescendants()) do
+		if v:IsA("BasePart") and v.Name ~= "HumanoidRootPart" then
+			pcall(function() PhysicsService:SetPartCollisionGroup(v, "NoFling") end)
+		end
+	end
+
+	local hitGP = ins("BoolValue", char)
+	hitGP.Name = "HitfloorGP"
+	hitGP.Value = false
+	local GFX = ins("Model", char)
+	GFX.Name = "GFX"
+
+	local running = rootpart:FindFirstChild("Running")
+	if not running then
+		running = ins("Sound", rootpart)
+		running.Name = "Running"
+		running.SoundId = "rbxasset://sounds/Swoosh.mp3"
+		running.Volume = 0
+		running.TimePosition = 0
+	end
+	local jumpingSound = rootpart:FindFirstChild("Jumping")
+	if jumpingSound then jumpingSound.Pitch = 0 end
+
+	-- Movement state (per character)
+	local pose, grounded, OnSlope, speed = "None", true, false, 0
+	local stage, JumpStage = 0, 0
+	local triplejumping, doublejump, jumping = false, false, false
+	local WallJumping, Scootering = false, false
+	local FadeAmount, FadeAmount2 = 0.3, 0.15
+	local JumpCooldown = Settings.WallJumpCooldown
+	local GrabCooldown = Settings.WallJumpCooldown
+	local WallGripLeft, JumpWait, GrabWait = 0, 0, 0
+	local GripLookVector = Vector3.new(0, 0, -1)
+	local jump = false
+	local falling = false
+
+	local raycastParams = RaycastParams.new()
+	raycastParams.FilterType = Enum.RaycastFilterType.Blacklist
+	raycastParams.FilterDescendantsInstances = {char, GFX, workspace.CurrentCamera}
+	raycastParams.IgnoreWater = true
+	raycastParams.RespectCanCollide = true
+
+	track(hum.Running:Connect(function(s) speed = s end))
+
+	-- Ground/slope/state detection + emote-facing
+	track(RunService.RenderStepped:Connect(function(dt)
+		if Cur.session ~= session then return end
+
+		-- Head camera (from Forsaken): offsets the camera to the head based on mode
+		local headCamOn
+		if HeadCam.mode == 1 then headCamOn = AbilityVars.Emoting
+		elseif HeadCam.mode == 2 then headCamOn = not AbilityVars.Emoting
+		elseif HeadCam.mode == 3 then headCamOn = true
+		else headCamOn = false end
+		local head = char:FindFirstChild("Head")
+		local alpha = math.min(dt * 5, 1)
+		if headCamOn and head then
+			local goal = (rootpart.CFrame + Vector3.new(0, 1.5, 0)):PointToObjectSpace(head.Position)
+			hum.CameraOffset = hum.CameraOffset:Lerp(goal, alpha)
+		else
+			hum.CameraOffset = hum.CameraOffset:Lerp(Vector3.zero, alpha)
+		end
+
+		-- While emoting (non-moving emotes), holding a direction turns the character to face it
+		if AbilityVars.Emoting and not AbilityVars.MovingEmote then
+			local md = hum.MoveDirection
+			local flat = Vector3.new(md.X, 0, md.Z)
+			if flat.Magnitude > 0.01 then
+				rootpart.CFrame = rootpart.CFrame:Lerp(CFrame.lookAt(rootpart.Position, rootpart.Position + flat), 0.1)
+			end
+		end
+
+		local ray = workspace:Raycast(rootpart.Position, Vector3.new(0, -3000, 0), raycastParams)
+		local rootvel = math.floor(rootpart.Velocity.Y)
+		local moving = hum.MoveDirection ~= Vector3.zero
+
+		if ray then
+			local dis = (rootpart.Position - ray.Position).Magnitude
+			if dis > 3.8 and rootpart.Velocity.Y > 1 then pose = "Jumping"; grounded = false end
+			if dis > 3.8 and rootpart.Velocity.Y < -1 then pose = "Falling"; grounded = false end
+			if dis < 4 and AbilityVars.GroundPounding then AbilityVars.hitfloor = true end
+			if dis < 3.8 then
+				pose = moving and "Walking" or "Standing"
+				grounded = true
+			end
+		else
+			if rootpart.Velocity.Y > 0 and not grounded then pose = "Jumping"; grounded = false end
+			if rootpart.Velocity.Y < 0 and not grounded then pose = "Falling"; grounded = false end
+			if not moving and grounded then pose = "Standing"; grounded = true end
+			if moving and grounded then pose = "Walking"; grounded = true end
+		end
+
+		local st = States:GetState()
+		-- Emoting is excluded so the slope code can't un-freeze a stationary emote
+		local canSlope = not AbilityVars.Diving and grounded and st == "Default" and not AbilityVars.Crouching and not AbilityVars.Emoting
+		if rootvel > 5 and canSlope then
+			hum.WalkSpeed = math.clamp(hum.WalkSpeed - Settings.SlopeSpeedLossRate, Settings.MinSlopeSpeed, Settings.MaxSlopeSpeed)
+			OnSlope = true
+			if AbilityVars.DiveSliding then
+				AbilityVars.DiveSpeed = math.clamp(AbilityVars.DiveSpeed - Settings.SlopeDiveSlideLossRate, 0, 50)
+			end
+		elseif rootvel < -4 and canSlope then
+			hum.WalkSpeed = math.clamp(hum.WalkSpeed + Settings.SlopeSpeedGainRate, 0, Settings.MaxSlopeSpeed)
+			OnSlope = true
+			if AbilityVars.DiveSliding then
+				AbilityVars.DiveSpeed = math.clamp(AbilityVars.DiveSpeed + Settings.SlopeDiveSlideGainRate, 0, 50)
+			end
+		elseif rootvel <= 0 and rootvel >= -4 and pose == "Walking" and grounded then
+			OnSlope = false
+		end
+	end))
+
+	-- Dust loop
+	task.spawn(function()
+		while session.alive do
+			task.wait()
+			if AbilityVars.DiveSliding then
+				Effects.Dust()
+				task.wait(0.02)
+			end
+			if WallJumping then
+				Effects.WalljumpDust()
+				task.wait(0.02)
+			end
+		end
+	end)
+
+	-- Jump progression
+	local function onJump(val)
+		if AbilityVars.Emoting then return end
+		jumping = val
+		if jumping then AbilityVars.backflipping = false end
+
+		if jumping and JumpStage == 2 then
+			if hum.MoveDirection == Vector3.zero then
+				AbilityVars.LongJumping = false
+				JumpStage = 0
+				doublejump = false
+				OnSlope = false
+				A.DoubleJump:Stop()
+				Sounds.PlaySound(char, JUMP_SOUND, 3, 1)
+				if math.random(1, 2) == 1 then A.Jump1:Play(FadeAmount2) else A.Jump2:Play(FadeAmount2) end
+				return
+			end
+			if AbilityVars.Trail then AbilityVars.Trail.Enabled = true end
+			grounded = false
+			OnSlope = false
+			JumpStage = 3
+			triplejumping = true
+			A.TripleJump:Play(FadeAmount2)
+			Sounds.PlaySound(char, JUMP_SOUND, 3, 2)
+			rootpart.Velocity = Vector3.new(0, Settings.TripleJumpHeight + hum.WalkSpeed / Settings.JumpWalkSpeedBonusDivisor, 0)
+
+		elseif jumping and JumpStage == 1 then
+			if hum.MoveDirection == Vector3.zero then
+				AbilityVars.LongJumping = false
+				OnSlope = false
+				grounded = false
+				JumpStage = 0
+				doublejump = false
+				A.DoubleJump:Stop()
+				Sounds.PlaySound(char, JUMP_SOUND, 3, 1)
+				if math.random(1, 2) == 1 then A.Jump1:Play(FadeAmount2) else A.Jump2:Play(FadeAmount2) end
+				return
+			end
+			JumpStage = 2
+			Sounds.PlaySound(char, JUMP_SOUND, 3, 1.5)
+			rootpart.Velocity = Vector3.new(0, Settings.DoubleJumpHeight + hum.WalkSpeed / Settings.JumpWalkSpeedBonusDivisor, 0)
+			doublejump = true
+			A.DoubleJump:Play(FadeAmount2)
+
+		elseif jumping and JumpStage == 0 then
+			grounded = false
+			OnSlope = false
+			JumpStage = 1
+			doublejump = false
+			triplejumping = false
+			rootpart.Velocity = Vector3.new(0, Settings.RegularJumpHeight + hum.WalkSpeed / Settings.JumpWalkSpeedBonusDivisor, 0)
+			Sounds.PlaySound(char, JUMP_SOUND, 3, 1)
+		end
+	end
+	track(hum.Jumping:Connect(onJump))
+
+	track(hum.FreeFalling:Connect(function(val)
+		falling = val
+		if val == false then
+			task.wait(0.15)
+			if JumpStage > 0 and falling == false then
+				JumpStage = 0
+				triplejumping = false
+				doublejump = false
+			end
+		end
+	end))
+
+	-- Crouch / ground pound helpers
+	local function crouch()
+		pcall(function()
+			if AbilityVars.Emoting then return end
+			if not AbilityVars.GroundPounding and not AbilityVars.LongJumping and not AbilityVars.Diving and not WallJumping and not doublejump and pose ~= "Jumping" and pose ~= "Freefall" and grounded then
+				AbilityVars.Crouching = true
+				OnSlope = true
+				AbilityVars.backflipping = false
+				hum.WalkSpeed = Settings.CrouchWalkSpeed
+				hum.JumpPower = 0
+				AbilityVars.cananimate = false
+				for _, t in ipairs(hum:GetPlayingAnimationTracks()) do t:Stop() end
+				A.Crouch:Play()
+				-- Frozen (speed 0) while standing still, animating while moving
+				A.Crouch:AdjustSpeed(hum.MoveDirection.Magnitude > 0.05 and 1 or 0)
+			end
+			if not grounded and not AbilityVars.Diving then
+				GroundPound_Ability()
+				AbilityVars.Crouching = false
+			end
+		end)
+	end
+
+	local function uncrouch()
+		pcall(function()
+			if not AbilityVars.LongJumping and not AbilityVars.Diving and not AbilityVars.DiveSliding and pose ~= "Jumping" and pose ~= "Freefall" and grounded then
+				AbilityVars.Crouching = false
+				OnSlope = false
+				AbilityVars.cananimate = true
+				hum.JumpPower = Settings.BaseJumpPower
+				A.Crouch:Stop()
+			end
+		end)
+	end
+
+	Cur.ctl = { crouch = crouch, uncrouch = uncrouch }
+
+	-- Input (PC only; mobile buttons are built once globally and call Cur.ctl)
+	if not isMobile then
+		track(UserInputService.JumpRequest:Connect(function()
+			if hum.FloorMaterial == Enum.Material.Air then
+				jump = true
+				hum.JumpPower = 0
+			end
+		end))
+		track(UserInputService.InputBegan:Connect(function(io)
+			if io.KeyCode == Enum.KeyCode.Space or io.KeyCode == Enum.KeyCode.ButtonA then
+				if not jump then
+					hum.JumpPower = Settings.BaseJumpPower
+					hum.Jump = true
+				end
+			elseif io.KeyCode == Enum.KeyCode.LeftControl or io.KeyCode == Enum.KeyCode.ButtonR2 then
+				crouch()
+			end
+		end))
+		track(UserInputService.InputEnded:Connect(function(io)
+			if io.KeyCode == Enum.KeyCode.Space or io.KeyCode == Enum.KeyCode.ButtonA then
+				jump = false
+			elseif io.KeyCode == Enum.KeyCode.LeftControl or io.KeyCode == Enum.KeyCode.ButtonR2 then
+				uncrouch()
+			end
+		end))
+	end
+
+	-- Space/ability input routing
+	track(UserInputService.JumpRequest:Connect(function()
+		if AbilityVars.Emoting then return end
+		if AbilityVars.DiveSliding then
+			CancelSlide_Ability()
+		elseif AbilityVars.Crouching and hum.MoveDirection ~= Vector3.zero then
+			LongJump_Ability()
+		elseif AbilityVars.Crouching and hum.MoveDirection == Vector3.zero then
+			Backflip_Ability()
+		end
+	end))
+
+	ContextActionService:BindAction("Dive", function(_, state)
+		if AbilityVars.Emoting then return end
+		if state == Enum.UserInputState.Begin and not AbilityVars.GroundPounding and not WallJumping then
+			Dive_Ability()
+		end
+	end, true, Enum.KeyCode.LeftShift, Enum.KeyCode.ButtonB)
+
+	-- Wall jump
+	local function clearWall()
+		WallJumping = false
+		WallGripLeft = 0
+		OnSlope = false
+		hum.AutoRotate = true
+		GrabWait = GrabCooldown
+		A.WallJump:Stop()
+		AbilityVars.cananimate = true
+		local bv = rootpart:FindFirstChild("BodyVelocity")
+		if bv then bv:Destroy() end
+	end
+	local function loseGrip()
+		clearWall()
+		hum:ChangeState(Enum.HumanoidStateType.Freefall)
+	end
+	local function land() clearWall() end
+
+	track(RunService.Heartbeat:Connect(function()
+		if AbilityVars.Emoting or Cur.session ~= session then return end
+		if hum:GetState() ~= Enum.HumanoidStateType.Freefall or Scootering then return end
+
+		local ray = Ray.new(rootpart.Position, rootpart.CFrame.LookVector * 1.5)
+		local ray2 = Ray.new(rootpart.Position, rootpart.CFrame.LookVector * -1.5)
+		local hit, _, normal = workspace:FindPartOnRay(ray, char)
+		local hit2 = workspace:FindPartOnRay(ray2, char)
+
+		if hit then
+			if not hit:FindFirstChild("_Wall") and hit.CanCollide and hit.Transparency ~= 1 and not WallJumping then
+				WallJumping = true
+				JumpStage = 0
+				local normalCFrame = hit.CFrame:ToObjectSpace(CFrame.new(Vector3.zero, normal))
+				normalCFrame = normalCFrame - normalCFrame.Position
+				local offsetCFrame = CFrame.new((hit.CFrame:Inverse() * rootpart.CFrame).Position)
+				local newCFrame = hit.CFrame * offsetCFrame * normalCFrame
+
+				for _, t in ipairs(hum:GetPlayingAnimationTracks()) do t:Stop() end
+
+				AbilityVars.cananimate = false
+				A.WallJump:Play()
+				OnSlope = true
+				hum.AutoRotate = false
+				Sounds.PlaySound(char, LAND_SOUND, 3, 1)
+
+				local bv = ins("BodyVelocity", rootpart)
+				bv.Velocity = Vector3.new(0, -10, 0)
+				bv.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+				rootpart.CFrame = newCFrame
+				GripLookVector = newCFrame.LookVector
+				WallGripLeft = Settings.WallGripDuration
+				JumpWait = JumpCooldown
+			end
+		elseif not hit2 and WallJumping then
+			loseGrip()
+		end
+	end))
+
+	track(hum:GetPropertyChangedSignal("Jump"):Connect(function()
+		if AbilityVars.Emoting then return end
+		if WallJumping and hum.Jump and JumpWait >= 0 then
+			loseGrip()
+			Sounds.PlaySound(char, JUMP_SOUND, 3, 1)
+			triplejumping = false
+			doublejump = false
+			rootpart.Velocity = Vector3.new(0, Settings.WallJumpUpForce, 0) + GripLookVector * Settings.WallJumpPushForce
+		end
+	end))
+
+	-- State changes (landings, dive slide, long jump landing, ground pound hit)
+	track(hum.StateChanged:Connect(function(old, new)
+		pcall(function()
+			local landing = rootpart:FindFirstChild("Landing")
+			local runSound = rootpart:FindFirstChild("Running")
+			local function landSound()
+				if landing then Sounds.PlaySound(char, landing.SoundId, 3, 1) end
+			end
+			local function setRunVol(v)
+				if runSound then runSound.Volume = v end
+			end
+			local isRunning = new == Enum.HumanoidStateType.Running or new == Enum.HumanoidStateType.RunningNoPhysics
+
+			if AbilityVars.Diving and old == Enum.HumanoidStateType.Flying then
+				AbilityVars.Diving = false
+				AbilityVars.canDive = true
+				landSound()
+				hum.JumpPower = 0
+				setRunVol(1)
+				DiveSlide_Ability()
+
+			elseif new == Enum.HumanoidStateType.Landed and old == Enum.HumanoidStateType.Freefall then
+				triplejumping = false
+				A.TripleJump:Stop()
+				if AbilityVars.Trail then AbilityVars.Trail.Enabled = false end
+				jump = false
+				grounded = true
+				land()
+				Effects.LandEffect(char, 1.7, 8)
+				landSound()
+
+			elseif AbilityVars.LongJumping and old == Enum.HumanoidStateType.Flying then
+				if isRunning then
+					AbilityVars.LongJumping = false
+					AbilityVars.cananimate = true
+					OnSlope = false
+					if AbilityVars.Trail then AbilityVars.Trail.Enabled = false end
+					hum.WalkSpeed = Settings.LongJumpLandWalkSpeed
+					landSound()
+					Effects.LandEffect(char, 1.7, 8)
+					setRunVol(1)
+				end
+
+			elseif old == Enum.HumanoidStateType.Flying then
+				if isRunning then
+					landSound()
+					Effects.LandEffect(char, 1.7, 8)
+					A.TripleJump:Stop()
+					triplejumping = false
+					AbilityVars.cananimate = true
+					setRunVol(1)
+				end
+			end
+
+			if isRunning then
+				grounded = true
+			elseif new == Enum.HumanoidStateType.Freefall or new == Enum.HumanoidStateType.Jumping then
+				grounded = false
+			end
+
+			if AbilityVars.backflipping and old == Enum.HumanoidStateType.Flying and isRunning then
+				AbilityVars.backflipping = false
+				landSound()
+				Effects.LandEffect(char, 1.7, 8)
+			end
+
+			if AbilityVars.GroundPounding and old == Enum.HumanoidStateType.Freefall then
+				AbilityVars.hitfloor = true
+				AbilityVars.backflipping = false
+				JumpStage = 1
+				task.wait(0.35)
+				JumpStage = 0
+			end
+		end)
+	end))
+
+	-- Animation controller
+	task.spawn(function()
+		while session.alive do
+			task.wait()
+			if AbilityVars.Emoting then continue end
+
+			-- Idle variant timer resets whenever the character stops standing still
+			if pose ~= "Standing" or not AbilityVars.cananimate then
+				if Cur.variantEnd or Cur.idleStill then stopIdleVariant() end
+			end
+
+			local tracks = hum:GetPlayingAnimationTracks()
+			local moving = hum.MoveDirection.Magnitude > 0.05
+			A.Walk:AdjustSpeed(math.clamp(hum.WalkSpeed / 15, 0, 2))
+
+			-- Crouch freeze: stopped = frozen, moving = animating
+			if AbilityVars.Crouching and A.Crouch.IsPlaying then
+				A.Crouch:AdjustSpeed(moving and 1 or 0)
+			end
+
+			if pose == "Walking" and AbilityVars.cananimate then
+				if hum.WalkSpeed < 36 then
+					stage = 1
+					if not OnSlope and hum.WalkSpeed < Settings.MinSlopeSpeed and States:GetState() == "Default" then
+						hum.WalkSpeed = hum.WalkSpeed + Settings.WalkAccelRate
+					end
+					if hum.WalkSpeed > Settings.MinSlopeSpeed then
+						hum.WalkSpeed = hum.WalkSpeed - Settings.WalkDecelRate
+					end
+					for _, t in ipairs(tracks) do
+						if t ~= A.Walk and t ~= A.TripleJump then t:Stop() end
+					end
+					if stage ~= 2 and stage ~= 3 and not A.Walk.IsPlaying then A.Walk:Play() end
+				end
+
+			elseif pose == "Standing" and AbilityVars.cananimate then
+				if States:GetState() == "Default" then hum.WalkSpeed = Settings.BaseWalkSpeed end
+				local now = os.clock()
+
+				if Cur.variantEnd then
+					-- Variant is playing: end it after its duration or when the player moves
+					if now >= Cur.variantEnd or moving then
+						stopIdleVariant()
+						Cur.idleStill = now -- restart the wait before the next variant
+					else
+						for _, t in ipairs(tracks) do
+							if t ~= A.IdleVariant then t:Stop() end
+						end
+					end
+				end
+
+				if not Cur.variantEnd then
+					Cur.idleStill = Cur.idleStill or now
+					for _, t in ipairs(tracks) do
+						if t ~= A.Idle then t:Stop() end
+					end
+					if A.IdleVariant and now - Cur.idleStill >= IDLE_VARIANT_DELAY then
+						Cur.variantEnd = now + math.random(90, 100) / 10
+						A.Idle:Stop(0.25)
+						A.IdleVariant:Play(0.25)
+					elseif not A.Idle.IsPlaying then
+						A.Idle:Play()
+					end
+				end
+
+			elseif pose == "Jumping" and AbilityVars.cananimate then
+				for _, t in ipairs(tracks) do
+					if t ~= A.Jump1 and t ~= A.Jump2 and t ~= A.DoubleJump and t ~= A.TripleJump and t ~= A.Backflip then
+						t:Stop(FadeAmount2)
+					end
+				end
+				local anyJumpPlaying = A.Jump1.IsPlaying or A.Jump2.IsPlaying or A.DoubleJump.IsPlaying or A.TripleJump.IsPlaying or A.Backflip.IsPlaying
+				if not anyJumpPlaying then
+					local bf = AbilityVars.backflipping
+					if not doublejump and not triplejumping and not bf then
+						A.TripleJump:Stop()
+						A.DoubleJump:Stop()
+						A.Backflip:Stop()
+						if math.random(1, 2) == 1 then A.Jump1:Play(FadeAmount2) else A.Jump2:Play(FadeAmount2) end
+					elseif doublejump and not triplejumping and not bf then
+						A.DoubleJump:Play(FadeAmount2)
+					elseif triplejumping and not doublejump and not bf then
+						A.TripleJump:Play(FadeAmount2)
+					elseif bf and not doublejump and not triplejumping then
+						A.Backflip:Play()
+					end
+				end
+
+			elseif pose == "Falling" and AbilityVars.cananimate then
+				for _, t in ipairs(tracks) do
+					if t ~= A.Fall and t ~= A.TripleJump then t:Stop(FadeAmount) end
+				end
+				if not A.Fall.IsPlaying and not A.TripleJump.IsPlaying then A.Fall:Play(FadeAmount) end
+			end
+		end
+	end)
+
+	-- Clear emote when the character dies (the new character gets a fresh setup)
+	track(hum.Died:Connect(function() pcall(clearEmote) end))
+
+	hum.WalkSpeed = Settings.BaseWalkSpeed
+end
+
+--==================================================================--
+--// MOBILE BUTTONS (built once, call into the current character) //--
+--==================================================================--
+
+if isMobile then
+	local old = plr.PlayerGui:FindFirstChild("MobileParkourGui")
+	if old then old:Destroy() end
+
+	mobileGui = ins("ScreenGui")
+	mobileGui.Name = "MobileParkourGui"
+	mobileGui.ResetOnSpawn = false
+	mobileGui.SafeAreaCompatible = true
+	mobileGui.Parent = plr:WaitForChild("PlayerGui")
+
+	local function mkBtn(name, text, pos, color, size)
+		local b = ins("TextButton")
+		b.Name = name
+		b.Size = UDim2.new(0, 100, 0, 100)
+		b.Position = pos
+		b.BackgroundColor3 = color
+		b.TextColor3 = Color3.new(1, 1, 1)
+		b.TextSize = size or 16
+		b.Text = text
+		b.Font = Enum.Font.GothamBold
+		b.Parent = mobileGui
+		return b
+	end
+
+	local crouchBtn = mkBtn("CrouchBtn", "CROUCH\n(CTRL)", UDim2.new(0, 20, 1, -220), Color3.fromRGB(50, 50, 150))
+	crouchBtn.MouseButton1Down:Connect(function() ctl("crouch") end)
+	crouchBtn.MouseButton1Up:Connect(function() ctl("uncrouch") end)
+
+	local diveBtn = mkBtn("DiveBtn", "DIVE\n(SHIFT)", UDim2.new(0, 130, 1, -220), Color3.fromRGB(150, 50, 50))
+	diveBtn.MouseButton1Down:Connect(function() Dive_Ability() end)
+
+	local slideBtn = mkBtn("SlideBtn", "CANCEL\nSLIDE", UDim2.new(0, 240, 1, -220), Color3.fromRGB(150, 100, 50), 14)
+	slideBtn.MouseButton1Down:Connect(function() CancelSlide_Ability() end)
+
+	local poundBtn = mkBtn("GroundPoundBtn", "GROUND\nPOUND", UDim2.new(0, 350, 1, -220), Color3.fromRGB(100, 150, 50), 12)
+	poundBtn.MouseButton1Down:Connect(function() GroundPound_Ability() end)
+end
+
+--==================================================================--
+--// MAIN UI (built once, persists across respawns) //--
+--==================================================================--
+
+local function makeDraggable(guiObject, dragButton)
+	local dragging = false
+	local dragInput, mousePos, framePos
+	dragButton.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			mousePos = input.Position
+			framePos = guiObject.Position
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then dragging = false end
+			end)
+		end
+	end)
+	dragButton.InputChanged:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+			dragInput = input
+		end
+	end)
+	gconn(UserInputService.InputChanged:Connect(function(input)
+		if input == dragInput and dragging then
+			local delta = input.Position - mousePos
+			guiObject.Position = UDim2.new(framePos.X.Scale, framePos.X.Offset + delta.X, framePos.Y.Scale, framePos.Y.Offset + delta.Y)
+		end
+	end))
+end
+
+-- Panel handles (declared here so hideOthers can see them)
+local ef, af, stf
+
+do
+	local oldGui = plr.PlayerGui:FindFirstChild("ParkourEmoteGui")
+	if oldGui then oldGui:Destroy() end
+
+	sg = ins("ScreenGui")
+	sg.Name = "ParkourEmoteGui"
+	sg.ResetOnSpawn = false
+	sg.Parent = plr:WaitForChild("PlayerGui")
+
+	local function corner(parent, r)
+		local c = ins("UICorner", parent)
+		c.CornerRadius = UDim.new(0, r)
+	end
+
+	local function mainButton(name, text, yOffset)
+		local b = ins("TextButton")
+		b.Name = name
+		b.Size = ud2(0, 110, 0, 44)
+		b.Position = ud2(1, -130, 1, yOffset)
+		b.AnchorPoint = v2(0, 1)
+		b.BackgroundColor3 = c3(30, 30, 30)
+		b.Text = text
+		b.TextColor3 = c3(255, 255, 255)
+		b.Font = Enum.Font.GothamBold
+		b.TextSize = 16
+		b.Parent = sg
+		return b
+	end
+
+	local emotesToggleBtn = mainButton("EmotesToggle", "Emotes", -80)
+	local animsToggleBtn = mainButton("AnimationsToggle", "Animations", -130)
+	local settingsToggleBtn = mainButton("SettingsToggle", "Settings", -180)
+
+	-- Stop-emote button (visible while an emote is playing, even with panels closed)
+	stopE = ins("TextButton")
+	stopE.Name = "StopEmote"
+	stopE.Size = ud2(0, 200, 0, 36)
+	stopE.Position = ud2(0.5, 0, 0, 70)
+	stopE.AnchorPoint = v2(0.5, 0)
+	stopE.BackgroundColor3 = c3(150, 0, 0)
+	stopE.Text = "STOP EMOTE"
+	stopE.TextColor3 = c3(255, 255, 255)
+	stopE.Font = Enum.Font.GothamBold
+	stopE.TextSize = 16
+	stopE.Visible = false
+	stopE.Parent = sg
+	corner(stopE, 6)
+	stopE.MouseButton1Click:Connect(clearEmote)
+
+	local function panel(name, title, size)
+		local f = ins("Frame")
+		f.Name = name
+		f.Size = size
+		f.Position = ud2(0.5, 0, 0.5, 0)
+		f.AnchorPoint = v2(0.5, 0.5)
+		f.BackgroundColor3 = c3(15, 15, 15)
+		f.BorderSizePixel = 0
+		f.Visible = false
+		f.Parent = sg
+		corner(f, 8)
+
+		local header = ins("TextLabel")
+		header.Size = ud2(1, 0, 0, 36)
+		header.BackgroundTransparency = 1
+		header.Text = title
+		header.TextColor3 = c3(255, 255, 255)
+		header.Font = Enum.Font.GothamBold
+		header.TextSize = 16
+		header.Parent = f
+		makeDraggable(f, header)
+
+		local close = ins("TextButton")
+		close.Size = ud2(0, 30, 0, 30)
+		close.Position = ud2(1, -35, 0, 3)
+		close.BackgroundColor3 = c3(150, 0, 0)
+		close.Text = "X"
+		close.TextColor3 = c3(255, 255, 255)
+		close.Font = Enum.Font.GothamBold
+		close.TextSize = 16
+		close.Parent = f
+		close.MouseButton1Click:Connect(function() f.Visible = false end)
+		return f
+	end
+
+	local function hideOthers(keep)
+		for _, f in ipairs({ef, af, stf}) do
+			if f ~= keep then f.Visible = false end
+		end
+	end
+
+	-- EMOTE PANEL
+	ef = panel("EmoteMenu", "EMOTES", ud2(0, 280, 0, 480))
+
+	local searchBar = ins("TextBox")
+	searchBar.Size = ud2(1, -20, 0, 28)
+	searchBar.Position = ud2(0, 10, 0, 40)
+	searchBar.BackgroundColor3 = c3(40, 40, 40)
+	searchBar.Text = ""
+	searchBar.PlaceholderText = "Search emotes..."
+	searchBar.TextColor3 = c3(255, 255, 255)
+	searchBar.PlaceholderColor3 = c3(150, 150, 150)
+	searchBar.Font = Enum.Font.Gotham
+	searchBar.TextSize = 14
+	searchBar.Parent = ef
+	corner(searchBar, 4)
+
+	local sf = ins("ScrollingFrame")
+	sf.Size = ud2(1, -10, 1, -85)
+	sf.Position = ud2(0, 5, 0, 75)
+	sf.BackgroundTransparency = 1
+	sf.CanvasSize = ud2(0, 0, 0, 0)
+	sf.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	sf.ScrollBarThickness = 4
+	sf.Parent = ef
+	local sfLayout = ins("UIListLayout")
+	sfLayout.Padding = UDim.new(0, 5)
+	sfLayout.Parent = sf
+
+	local emoteButtons = {}
+	for _, entry in ipairs(EMOTES) do
+		local b = ins("TextButton")
+		b.Size = ud2(1, 0, 0, 34)
+		b.BackgroundColor3 = c3(40, 40, 40)
+		b.Text = entry[1]
+		b.TextColor3 = c3(255, 255, 255)
+		b.Font = Enum.Font.Gotham
+		b.TextSize = 15
+		b.Parent = sf
+		corner(b, 4)
+		b.MouseButton1Click:Connect(function() playEmote(entry) end)
+		table.insert(emoteButtons, {button = b, name = entry[1]:lower()})
+	end
+
+	searchBar:GetPropertyChangedSignal("Text"):Connect(function()
+		local q = searchBar.Text:lower()
+		for _, d in ipairs(emoteButtons) do
+			d.button.Visible = q == "" or d.name:find(q, 1, true) ~= nil
+		end
+	end)
+
+	-- ANIMATION PANEL
+	af = panel("AnimPresetMenu", "ANIMATION CUSTOMIZER", ud2(0, 320, 0, 520))
+
+	local tabHolder = ins("ScrollingFrame")
+	tabHolder.Size = ud2(1, -20, 0, 60)
+	tabHolder.Position = ud2(0, 10, 0, 40)
+	tabHolder.BackgroundTransparency = 1
+	tabHolder.ScrollBarThickness = 0
+	tabHolder.CanvasSize = ud2(0, 0, 0, 0)
+	tabHolder.AutomaticCanvasSize = Enum.AutomaticSize.X
+	tabHolder.Parent = af
+	local tabLayout = ins("UIListLayout")
+	tabLayout.FillDirection = Enum.FillDirection.Horizontal
+	tabLayout.Padding = UDim.new(0, 4)
+	tabLayout.Parent = tabHolder
+
+	local contentArea = ins("ScrollingFrame")
+	contentArea.Size = ud2(1, -20, 1, -115)
+	contentArea.Position = ud2(0, 10, 0, 115)
+	contentArea.BackgroundTransparency = 1
+	contentArea.CanvasSize = ud2(0, 0, 0, 0)
+	contentArea.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	contentArea.ScrollBarThickness = 4
+	contentArea.Parent = af
+
+	local function buildAnimList(kind, order)
+		local frame = ins("Frame")
+		frame.Size = ud2(1, 0, 0, 0)
+		frame.BackgroundTransparency = 1
+		frame.AutomaticSize = Enum.AutomaticSize.Y
+		frame.Visible = false
+		frame.Parent = contentArea
+		local layout = ins("UIListLayout")
+		layout.Padding = UDim.new(0, 4)
+		layout.Parent = frame
+
+		local buttons = {}
+		local function refresh()
+			for n, btn in pairs(buttons) do
+				local active = SelectedAnimations[kind] == n
+				btn.Text = n .. (active and " ✓" or "")
+				btn.TextColor3 = active and c3(0, 200, 255) or c3(200, 200, 200)
+			end
+		end
+		for _, name in ipairs(order) do
+			local b = ins("TextButton")
+			b.Size = ud2(1, 0, 0, 34)
+			b.BackgroundColor3 = c3(25, 25, 25)
+			b.Font = Enum.Font.Gotham
+			b.TextSize = 15
+			b.Parent = frame
+			corner(b, 4)
+			buttons[name] = b
+			b.MouseButton1Click:Connect(function()
+				applyAnim(kind, name)
+				refresh()
+			end)
+		end
+		refresh()
+		return frame
+	end
+
+	local ANIM_TABS = {
+		{"Idle", "Idle", IdleOrder}, {"Run", "Run", RunOrder}, {"Jump", "Jump", JumpOrder},
+		{"Fall", "Fall", FallOrder}, {"Crouch", "Crouch", CrouchOrder},
+		{"Wallslide", "WallSlide", WallSlideOrder}, {"Dive", "Dive", DiveOrder},
+	}
+	local lists = {}
+	for _, t in ipairs(ANIM_TABS) do
+		local tb = ins("TextButton")
+		tb.Size = UDim2.new(0, 85, 0, 44)
+		tb.BackgroundColor3 = c3(30, 30, 30)
+		tb.Text = t[1]
+		tb.TextColor3 = c3(255, 255, 255)
+		tb.Font = Enum.Font.GothamBold
+		tb.TextSize = 12
+		tb.Parent = tabHolder
+		corner(tb, 4)
+		lists[t[2]] = buildAnimList(t[2], t[3])
+		tb.MouseButton1Click:Connect(function()
+			for k, frame in pairs(lists) do frame.Visible = (k == t[2]) end
+			contentArea.CanvasPosition = Vector2.new(0, 0)
+		end)
+	end
+	lists.Idle.Visible = true
+
+	-- SETTINGS PANEL
+	local SettingsGroups = {
+		{ title = "General Movement", fields = {
+			{key = "BaseWalkSpeed", label = "Base Walk Speed", min = 4, max = 40, step = 1},
+			{key = "MinSlopeSpeed", label = "Min Slope Speed", min = 4, max = 40, step = 1},
+			{key = "MaxSlopeSpeed", label = "Max Slope Speed", min = 10, max = 60, step = 1},
+			{key = "BaseJumpPower", label = "Base Jump Power", min = 10, max = 120, step = 1},
+			{key = "MaxSlopeAngle", label = "Max Slope Angle", min = 0, max = 89, step = 1},
+		}},
+		{ title = "Jump Progression", fields = {
+			{key = "RegularJumpHeight", label = "1st Jump Height", min = 10, max = 150, step = 1},
+			{key = "DoubleJumpHeight", label = "2nd Jump Height", min = 10, max = 200, step = 1},
+			{key = "TripleJumpHeight", label = "3rd Jump Height", min = 10, max = 250, step = 1},
+			{key = "JumpWalkSpeedBonusDivisor", label = "Jump Speed Bonus Divisor", min = 1, max = 20, step = 0.5},
+		}},
+		{ title = "Dive", fields = {
+			{key = "DiveForwardMultiplier", label = "Dive Forward Power", min = 0.5, max = 6, step = 0.1},
+			{key = "DiveUpwardBoost", label = "Dive Upward Boost", min = 0, max = 120, step = 1},
+			{key = "DiveSlideDeceleration", label = "Dive Slide Deceleration", min = 0.1, max = 5, step = 0.1},
+			{key = "DiveSlideStartPenalty", label = "Dive Slide Start Penalty", min = 0, max = 50, step = 1},
+			{key = "DiveSlideDownforce", label = "Dive Slide Downforce", min = -30, max = 0, step = 1},
+		}},
+		{ title = "Slide Cancel / Roll", fields = {
+			{key = "SlideCancelUpForce", label = "Roll Up Force", min = 0, max = 100, step = 1},
+			{key = "SlideCancelBackMultiplier", label = "Roll Back Multiplier", min = 0, max = 5, step = 0.1},
+		}},
+		{ title = "Long Jump", fields = {
+			{key = "LongJumpWalkSpeed", label = "Long Jump Walk Speed", min = 4, max = 60, step = 1},
+			{key = "LongJumpUpForce", label = "Long Jump Up Force", min = 0, max = 120, step = 1},
+			{key = "LongJumpForwardMultiplier", label = "Long Jump Forward Power", min = 0.5, max = 6, step = 0.1},
+			{key = "LongJumpLandWalkSpeed", label = "Long Jump Landing Speed", min = 4, max = 60, step = 1},
+		}},
+		{ title = "Backflip", fields = {
+			{key = "BackflipUpForce", label = "Backflip Up Force", min = 0, max = 150, step = 1},
+			{key = "BackflipBackForce", label = "Backflip Back Force", min = -30, max = 30, step = 1},
+		}},
+		{ title = "Ground Pound", fields = {
+			{key = "GroundPoundChargeTime", label = "Charge Time (s)", min = 0, max = 2, step = 0.05},
+			{key = "GroundPoundSlamSpeed", label = "Slam Speed", min = -150, max = -10, step = 1},
+			{key = "GroundPoundRecoveryTime", label = "Recovery Time (s)", min = 0, max = 1, step = 0.05},
+		}},
+		{ title = "Crouch", fields = {
+			{key = "CrouchWalkSpeed", label = "Crouch Walk Speed", min = 0, max = 20, step = 1},
+		}},
+		{ title = "Wall Jump", fields = {
+			{key = "WallGripDuration", label = "Wall Grip Duration (s)", min = 0.1, max = 4, step = 0.1},
+			{key = "WallJumpCooldown", label = "Wall Jump Cooldown (s)", min = 0, max = 1, step = 0.05},
+			{key = "WallJumpUpForce", label = "Wall Jump Up Force", min = 0, max = 120, step = 1},
+			{key = "WallJumpPushForce", label = "Wall Jump Push Force", min = 0, max = 120, step = 1},
+		}},
+		{ title = "Slope Physics", fields = {
+			{key = "SlopeSpeedGainRate", label = "Downhill Speed Gain Rate", min = 0, max = 2, step = 0.05},
+			{key = "SlopeSpeedLossRate", label = "Uphill Speed Loss Rate", min = 0, max = 2, step = 0.05},
+			{key = "SlopeDiveSlideGainRate", label = "Dive-Slide Downhill Gain", min = 0, max = 10, step = 0.5},
+			{key = "SlopeDiveSlideLossRate", label = "Dive-Slide Uphill Loss", min = 0, max = 10, step = 0.5},
+		}},
+		{ title = "Walk Acceleration", fields = {
+			{key = "WalkAccelRate", label = "Walk Accel Rate", min = 0, max = 3, step = 0.05},
+			{key = "WalkDecelRate", label = "Walk Decel Rate", min = 0, max = 3, step = 0.05},
+		}},
+	}
+
+	local SettingsDefaults = {}
+	for _, group in ipairs(SettingsGroups) do
+		for _, field in ipairs(group.fields) do SettingsDefaults[field.key] = Settings[field.key] end
+	end
+
+	stf = panel("SettingsMenu", "MOVEMENT SETTINGS", ud2(0, 340, 0, 520))
+
+	local stfReset = ins("TextButton")
+	stfReset.Size = ud2(0, 140, 0, 30)
+	stfReset.Position = ud2(0, 10, 0, 3)
+	stfReset.BackgroundColor3 = c3(60, 60, 60)
+	stfReset.Text = "Reset to Default"
+	stfReset.TextColor3 = c3(255, 255, 255)
+	stfReset.Font = Enum.Font.Gotham
+	stfReset.TextSize = 13
+	stfReset.Parent = stf
+
+	local stContent = ins("ScrollingFrame")
+	stContent.Size = ud2(1, -20, 1, -80)
+	stContent.Position = ud2(0, 10, 0, 40)
+	stContent.BackgroundTransparency = 1
+	stContent.CanvasSize = ud2(0, 0, 0, 0)
+	stContent.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	stContent.ScrollBarThickness = 4
+	stContent.Parent = stf
+	local stLayout = ins("UIListLayout")
+	stLayout.Padding = UDim.new(0, 10)
+	stLayout.Parent = stContent
+
+	local settingsRefreshers = {}
+	local function fmt(v)
+		if math.floor(v) == v then return tostring(math.floor(v)) end
+		return string.format("%.2f", v)
+	end
+
+	local function buildSlider(parent, field)
+		local row = ins("Frame")
+		row.Size = ud2(1, 0, 0, 46)
+		row.BackgroundTransparency = 1
+		row.Parent = parent
+
+		local label = ins("TextLabel")
+		label.Size = ud2(1, 0, 0, 18)
+		label.BackgroundTransparency = 1
+		label.TextColor3 = c3(220, 220, 220)
+		label.Font = Enum.Font.Gotham
+		label.TextSize = 13
+		label.TextXAlignment = Enum.TextXAlignment.Left
+		label.Parent = row
+
+		local bar = ins("Frame")
+		bar.Size = ud2(1, 0, 0, 18)
+		bar.Position = ud2(0, 0, 0, 24)
+		bar.BackgroundColor3 = c3(40, 40, 40)
+		bar.Parent = row
+		corner(bar, 4)
+
+		local fill = ins("Frame")
+		fill.BackgroundColor3 = c3(0, 150, 255)
+		fill.BorderSizePixel = 0
+		fill.Parent = bar
+		corner(fill, 4)
+
+		local knob = ins("TextButton")
+		knob.Size = ud2(0, 14, 0, 26)
+		knob.AnchorPoint = v2(0.5, 0.5)
+		knob.BackgroundColor3 = c3(255, 255, 255)
+		knob.Text = ""
+		knob.Parent = bar
+		corner(knob, 3)
+
+		local function render()
+			local v = Settings[field.key]
+			local frac = math.clamp((v - field.min) / (field.max - field.min), 0, 1)
+			fill.Size = ud2(frac, 0, 1, 0)
+			knob.Position = ud2(frac, 0, 0.5, 0)
+			label.Text = field.label .. ": " .. fmt(v)
+		end
+
+		local function setFromFraction(frac)
+			frac = math.clamp(frac, 0, 1)
+			local raw = field.min + (field.max - field.min) * frac
+			local stepped = math.clamp(math.floor((raw / field.step) + 0.5) * field.step, field.min, field.max)
+			Settings[field.key] = stepped
+			render()
+		end
+
+		render()
+		settingsRefreshers[field.key] = render
+
+		local dragging = false
+		knob.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then dragging = true end
+		end)
+		gconn(UserInputService.InputEnded:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then dragging = false end
+		end))
+		gconn(UserInputService.InputChanged:Connect(function(input)
+			if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+				if bar.AbsoluteSize.X > 0 then
+					setFromFraction((input.Position.X - bar.AbsolutePosition.X) / bar.AbsoluteSize.X)
+				end
+			end
+		end))
+		bar.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				if bar.AbsoluteSize.X > 0 then
+					setFromFraction((input.Position.X - bar.AbsolutePosition.X) / bar.AbsoluteSize.X)
+				end
+			end
+		end)
+	end
+
+	for _, group in ipairs(SettingsGroups) do
+		local gl = ins("TextLabel")
+		gl.Size = ud2(1, 0, 0, 22)
+		gl.BackgroundTransparency = 1
+		gl.Text = group.title
+		gl.TextColor3 = c3(0, 200, 255)
+		gl.Font = Enum.Font.GothamBold
+		gl.TextSize = 14
+		gl.TextXAlignment = Enum.TextXAlignment.Left
+		gl.Parent = stContent
+		for _, field in ipairs(group.fields) do buildSlider(stContent, field) end
+	end
+
+	-- Head camera options (from Forsaken)
+	local hcLabel = ins("TextLabel")
+	hcLabel.Size = ud2(1, 0, 0, 22)
+	hcLabel.BackgroundTransparency = 1
+	hcLabel.Text = "Head Camera"
+	hcLabel.TextColor3 = c3(0, 200, 255)
+	hcLabel.Font = Enum.Font.GothamBold
+	hcLabel.TextSize = 14
+	hcLabel.TextXAlignment = Enum.TextXAlignment.Left
+	hcLabel.Parent = stContent
+
+	local hcButtons = {}
+	local function refreshHeadCam()
+		for mode, b in pairs(hcButtons) do
+			b.BackgroundColor3 = HeadCam.mode == mode and c3(80, 150, 100) or c3(40, 80, 60)
+		end
+	end
+	local HEADCAM_OPTIONS = {
+		{0, "OFF - Disabled"},
+		{1, "EMOTING ONLY - When playing emotes"},
+		{2, "NOT EMOTING - When idle/walking/running"},
+		{3, "ALWAYS ON - Always follows head"},
+	}
+	for _, opt in ipairs(HEADCAM_OPTIONS) do
+		local b = ins("TextButton")
+		b.Size = ud2(1, 0, 0, 34)
+		b.BackgroundColor3 = c3(40, 80, 60)
+		b.Text = opt[2]
+		b.TextColor3 = c3(255, 255, 255)
+		b.Font = Enum.Font.GothamBold
+		b.TextSize = 12
+		b.Parent = stContent
+		corner(b, 4)
+		hcButtons[opt[1]] = b
+		b.MouseButton1Click:Connect(function()
+			HeadCam.mode = opt[1]
+			refreshHeadCam()
+		end)
+	end
+	refreshHeadCam()
+
+	stfReset.MouseButton1Click:Connect(function()
+		for key, val in pairs(SettingsDefaults) do
+			Settings[key] = val
+			if settingsRefreshers[key] then settingsRefreshers[key]() end
+		end
+	end)
+
+	-- TOGGLE BUTTONS
+	emotesToggleBtn.MouseButton1Click:Connect(function()
+		ef.Visible = not ef.Visible
+		hideOthers(ef)
+	end)
+	animsToggleBtn.MouseButton1Click:Connect(function()
+		af.Visible = not af.Visible
+		hideOthers(af)
+	end)
+	settingsToggleBtn.MouseButton1Click:Connect(function()
+		stf.Visible = not stf.Visible
+		hideOthers(stf)
+	end)
+
+	-- STOP SCRIPT DIALOG
+	local xb = ins("ImageButton")
+	xb.Name = "StopParkourBtn"
+	xb.Size = ud2(0, 40, 0, 40)
+	xb.Position = ud2(0.5, 0, 0, 20)
+	xb.AnchorPoint = v2(0.5, 0)
+	xb.Image = "http://www.roblox.com/asset/?id=16201262"
+	xb.BackgroundTransparency = 1
+	xb.Parent = sg
+
+	local cf = ins("Frame")
+	cf.Size = ud2(0, 300, 0, 150)
+	cf.Position = ud2(0.5, -150, 0.5, -75)
+	cf.BackgroundColor3 = c3(15, 15, 15)
+	cf.BorderSizePixel = 0
+	cf.Visible = false
+	cf.Parent = sg
+	corner(cf, 8)
+
+	local cl = ins("TextLabel")
+	cl.Size = ud2(1, -20, 0, 60)
+	cl.Position = ud2(0, 10, 0, 10)
+	cl.BackgroundTransparency = 1
+	cl.Text = "Do you want to disable the parkour script?"
+	cl.TextColor3 = c3(255, 255, 255)
+	cl.TextWrapped = true
+	cl.Font = Enum.Font.SourceSans
+	cl.TextSize = 18
+	cl.Parent = cf
+
+	local function confirmBtn(name, text, pos, color)
+		local b = ins("TextButton")
+		b.Name = name
+		b.Size = ud2(0, 100, 0, 40)
+		b.Position = pos
+		b.BackgroundColor3 = color
+		b.Text = text
+		b.TextColor3 = c3(255, 255, 255)
+		b.Font = Enum.Font.SourceSansBold
+		b.TextSize = 18
+		b.Parent = cf
+		return b
+	end
+	local bn = confirmBtn("No", "No", ud2(0, 40, 0, 85), c3(60, 60, 60))
+	local by = confirmBtn("Yes", "Yes", ud2(0, 160, 0, 85), c3(150, 0, 0))
+
+	xb.MouseButton1Click:Connect(function() cf.Visible = true end)
+	bn.MouseButton1Click:Connect(function() cf.Visible = false end)
+	by.MouseButton1Click:Connect(function() getgenv().ParkourShutdown() end)
+end
+
+--==================================================================--
+--// SHUTDOWN + CHARACTER HOOK //--
+--==================================================================--
+
+local function shutdown()
+	pcall(function()
+		local h = Cur.hum
+		if h then
+			for _, t in ipairs(h:GetPlayingAnimationTracks()) do t:Stop(0) end
+			h.WalkSpeed = 16
+			h.JumpPower = 50
+		end
+	end)
+	cleanupCharacter()
+	for _, c in ipairs(globalConns) do pcall(function() c:Disconnect() end) end
+	table.clear(globalConns)
+	if sg then sg:Destroy() end
+	if mobileGui then mobileGui:Destroy() end
+	getgenv().ParkourShutdown = nil
+end
+getgenv().ParkourShutdown = shutdown
+
+pcall(function() PhysicsService:CreateCollisionGroup("NoFling") end)
+
+gconn(plr.CharacterAdded:Connect(function(c)
+	task.spawn(setupCharacter, c)
+end))
+if plr.Character then
+	task.spawn(setupCharacter, plr.Character)
+end
+
+print("✓ Parkour Script Loaded (respawn-safe)")
+print("Controls:")
+print("  SPACE/A - Jump (progression)")
+print("  CTRL/R2 - Crouch / Ground Pound")
+print("  SHIFT/B - Dive")
+print("  SPACE + Crouch - Long Jump / Backflip")
+print("  Emotes / Animations / Settings buttons - bottom right of screen")
