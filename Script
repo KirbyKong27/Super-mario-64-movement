@@ -288,6 +288,18 @@ local SelectedAnimations = {
 local Cur = { char = nil, hum = nil, root = nil, animator = nil, anims = {}, session = nil, ctl = nil, variantEnd = nil, idleStill = nil }
 local EmoteState = { ca = nil, thread = nil, timer = nil, variation = nil }
 
+-- Rebindable keys (PC). Gamepad buttons stay fixed.
+local KeybindDefaults = { Crouch = Enum.KeyCode.LeftControl, Dive = Enum.KeyCode.LeftShift }
+local Keybinds = { Crouch = KeybindDefaults.Crouch, Dive = KeybindDefaults.Dive }
+
+-- Dive uses ContextActionService so it can be rebound while a character is alive
+local function bindDiveKey()
+	pcall(function() ContextActionService:UnbindAction("Dive") end)
+	if Cur.diveHandler then
+		ContextActionService:BindAction("Dive", Cur.diveHandler, true, Keybinds.Dive, Enum.KeyCode.ButtonB)
+	end
+end
+
 local function loadAnim(animator, id)
 	local anim = ins("Animation")
 	anim.AnimationId = id
@@ -859,6 +871,7 @@ local function cleanupCharacter()
 	EmoteState.ca = nil
 	Cur.ctl, Cur.hum, Cur.animator, Cur.char, Cur.root = nil, nil, nil, nil, nil
 	Cur.variantEnd, Cur.idleStill = nil, nil
+	Cur.diveHandler = nil
 	Cur.anims = {}
 	AbilityVars.char = nil
 end
@@ -992,12 +1005,6 @@ local function setupCharacter(newChar)
 	raycastParams.FilterDescendantsInstances = {char, GFX, workspace.CurrentCamera}
 	raycastParams.IgnoreWater = true
 	raycastParams.RespectCanCollide = true
-
-	local wallParams = RaycastParams.new()
-	wallParams.FilterType = Enum.RaycastFilterType.Blacklist
-	wallParams.FilterDescendantsInstances = {char, GFX}
-	wallParams.IgnoreWater = true
-	wallParams.RespectCanCollide = true
 
 	track(hum.Running:Connect(function(s) speed = s end))
 
@@ -1189,6 +1196,17 @@ local function setupCharacter(newChar)
 
 	Cur.ctl = { crouch = crouch, uncrouch = uncrouch }
 
+	local function routeJump()
+		if AbilityVars.Emoting then return end
+		if AbilityVars.DiveSliding then
+			CancelSlide_Ability()
+		elseif AbilityVars.Crouching and hum.MoveDirection ~= Vector3.zero then
+			LongJump_Ability()
+		elseif AbilityVars.Crouching and hum.MoveDirection == Vector3.zero then
+			Backflip_Ability()
+		end
+	end
+
 	-- Input (PC only; mobile buttons are built once globally and call Cur.ctl)
 	if not isMobile then
 		track(UserInputService.JumpRequest:Connect(function()
@@ -1203,37 +1221,29 @@ local function setupCharacter(newChar)
 					hum.JumpPower = Settings.BaseJumpPower
 					hum.Jump = true
 				end
-			elseif io.KeyCode == Enum.KeyCode.LeftControl or io.KeyCode == Enum.KeyCode.ButtonR2 then
+			elseif io.KeyCode == Keybinds.Crouch or io.KeyCode == Enum.KeyCode.ButtonR2 then
 				crouch()
 			end
 		end))
 		track(UserInputService.InputEnded:Connect(function(io)
 			if io.KeyCode == Enum.KeyCode.Space or io.KeyCode == Enum.KeyCode.ButtonA then
 				jump = false
-			elseif io.KeyCode == Enum.KeyCode.LeftControl or io.KeyCode == Enum.KeyCode.ButtonR2 then
+			elseif io.KeyCode == Keybinds.Crouch or io.KeyCode == Enum.KeyCode.ButtonR2 then
 				uncrouch()
 			end
 		end))
 	end
 
-	-- Space/ability input routing
-	track(UserInputService.JumpRequest:Connect(function()
-		if AbilityVars.Emoting then return end
-		if AbilityVars.DiveSliding then
-			CancelSlide_Ability()
-		elseif AbilityVars.Crouching and hum.MoveDirection ~= Vector3.zero then
-			LongJump_Ability()
-		elseif AbilityVars.Crouching and hum.MoveDirection == Vector3.zero then
-			Backflip_Ability()
-		end
-	end))
+	-- Space/ability input routing (Roblox JumpRequest fires for Space and touch jump)
+	track(UserInputService.JumpRequest:Connect(routeJump))
 
-	ContextActionService:BindAction("Dive", function(_, state)
+	Cur.diveHandler = function(_, state)
 		if AbilityVars.Emoting then return end
 		if state == Enum.UserInputState.Begin and not AbilityVars.GroundPounding and not WallJumping then
 			Dive_Ability()
 		end
-	end, true, Enum.KeyCode.LeftShift, Enum.KeyCode.ButtonB)
+	end
+	bindDiveKey()
 
 	-- Wall jump
 	local function clearWall()
@@ -1257,50 +1267,39 @@ local function setupCharacter(newChar)
 		if AbilityVars.Emoting or Cur.session ~= session then return end
 		if hum:GetState() ~= Enum.HumanoidStateType.Freefall or Scootering then return end
 
-		-- Already gripping: release once there's no wall behind the character
-		if WallJumping then
-			local behind = workspace:Raycast(rootpart.Position, rootpart.CFrame.LookVector * -1.5, wallParams)
-			if not behind then loseGrip() end
-			return
+		local ray = Ray.new(rootpart.Position, rootpart.CFrame.LookVector * 1.5)
+		local ray2 = Ray.new(rootpart.Position, rootpart.CFrame.LookVector * -1.5)
+		local hit, _, normal = workspace:FindPartOnRay(ray, char)
+		local hit2 = workspace:FindPartOnRay(ray2, char)
+
+		if hit then
+			if not hit:FindFirstChild("_Wall") and hit.CanCollide and hit.Transparency ~= 1 and not WallJumping then
+				WallJumping = true
+				JumpStage = 0
+				local normalCFrame = hit.CFrame:ToObjectSpace(CFrame.new(Vector3.zero, normal))
+				normalCFrame = normalCFrame - normalCFrame.Position
+				local offsetCFrame = CFrame.new((hit.CFrame:Inverse() * rootpart.CFrame).Position)
+				local newCFrame = hit.CFrame * offsetCFrame * normalCFrame
+
+				for _, t in ipairs(hum:GetPlayingAnimationTracks()) do t:Stop() end
+
+				AbilityVars.cananimate = false
+				A.WallJump:Play()
+				OnSlope = true
+				hum.AutoRotate = false
+				Sounds.PlaySound(char, LAND_SOUND, 3, 1)
+
+				local bv = ins("BodyVelocity", rootpart)
+				bv.Velocity = Vector3.new(0, -10, 0)
+				bv.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+				rootpart.CFrame = newCFrame
+				GripLookVector = newCFrame.LookVector
+				WallGripLeft = Settings.WallGripDuration
+				JumpWait = JumpCooldown
+			end
+		elseif not hit2 and WallJumping then
+			loseGrip()
 		end
-
-		-- Only grab while falling, never while rising past a ledge
-		if rootpart.Velocity.Y > 0 then return end
-		-- Near the floor means a landing, not a wall
-		if workspace:Raycast(rootpart.Position, Vector3.new(0, -8, 0), wallParams) then return end
-
-		local forward = rootpart.CFrame.LookVector
-		local hit = workspace:Raycast(rootpart.Position, forward * 1.5, wallParams)
-		if not hit then return end
-		-- Must be a steep surface that also continues above the root (not a ledge or step edge)
-		if math.abs(hit.Normal.Y) > 0.3 then return end
-		if not workspace:Raycast(rootpart.Position + Vector3.new(0, 1.5, 0), forward * 1.5, wallParams) then return end
-
-		local part, normal = hit.Instance, hit.Normal
-		if not part.CanCollide or part.Transparency == 1 or part:FindFirstChild("_Wall") then return end
-
-		WallJumping = true
-		JumpStage = 0
-		local normalCFrame = part.CFrame:ToObjectSpace(CFrame.new(Vector3.zero, normal))
-		normalCFrame = normalCFrame - normalCFrame.Position
-		local offsetCFrame = CFrame.new((part.CFrame:Inverse() * rootpart.CFrame).Position)
-		local newCFrame = part.CFrame * offsetCFrame * normalCFrame
-
-		for _, t in ipairs(hum:GetPlayingAnimationTracks()) do t:Stop() end
-
-		AbilityVars.cananimate = false
-		A.WallJump:Play()
-		OnSlope = true
-		hum.AutoRotate = false
-		Sounds.PlaySound(char, LAND_SOUND, 3, 1)
-
-		local bv = ins("BodyVelocity", rootpart)
-		bv.Velocity = Vector3.new(0, -10, 0)
-		bv.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
-		rootpart.CFrame = newCFrame
-		GripLookVector = newCFrame.LookVector
-		WallGripLeft = Settings.WallGripDuration
-		JumpWait = JumpCooldown
 	end))
 
 	track(hum:GetPropertyChangedSignal("Jump"):Connect(function()
@@ -2022,6 +2021,78 @@ do
 		end)
 	end
 	refreshHeadCam()
+
+	-- Keybinds
+	local kbLabel = ins("TextLabel")
+	kbLabel.Size = ud2(1, 0, 0, 22)
+	kbLabel.BackgroundTransparency = 1
+	kbLabel.Text = "Keybinds (PC)"
+	kbLabel.TextColor3 = c3(0, 200, 255)
+	kbLabel.Font = Enum.Font.GothamBold
+	kbLabel.TextSize = 14
+	kbLabel.TextXAlignment = Enum.TextXAlignment.Left
+	kbLabel.Parent = stContent
+
+	local keybindButtons = {}
+	local function refreshKeybinds()
+		for action, b in pairs(keybindButtons) do
+			b.Text = action .. ": " .. Keybinds[action].Name
+		end
+	end
+
+	local function rebind(action, newKey)
+		local old = Keybinds[action]
+		-- If another action already uses this key, that action takes the old key (swap)
+		for other, k in pairs(Keybinds) do
+			if other ~= action and k == newKey then Keybinds[other] = old end
+		end
+		Keybinds[action] = newKey
+		refreshKeybinds()
+		bindDiveKey()
+	end
+
+	local function startRebind(action)
+		keybindButtons[action].Text = action .. ": press a key (Esc cancels)"
+		local conn
+		conn = UserInputService.InputBegan:Connect(function(io)
+			if io.UserInputType ~= Enum.UserInputType.Keyboard then return end
+			conn:Disconnect()
+			if io.KeyCode == Enum.KeyCode.Escape then
+				refreshKeybinds()
+				return
+			end
+			rebind(action, io.KeyCode)
+		end)
+	end
+
+	for _, action in ipairs({"Crouch", "Dive"}) do
+		local b = ins("TextButton")
+		b.Size = ud2(1, 0, 0, 34)
+		b.BackgroundColor3 = c3(40, 40, 40)
+		b.TextColor3 = c3(255, 255, 255)
+		b.Font = Enum.Font.Gotham
+		b.TextSize = 13
+		b.Parent = stContent
+		corner(b, 4)
+		keybindButtons[action] = b
+		b.MouseButton1Click:Connect(function() startRebind(action) end)
+	end
+
+	local kbReset = ins("TextButton")
+	kbReset.Size = ud2(1, 0, 0, 34)
+	kbReset.BackgroundColor3 = c3(60, 60, 60)
+	kbReset.Text = "Reset Keybinds"
+	kbReset.TextColor3 = c3(255, 255, 255)
+	kbReset.Font = Enum.Font.GothamBold
+	kbReset.TextSize = 12
+	kbReset.Parent = stContent
+	corner(kbReset, 4)
+	kbReset.MouseButton1Click:Connect(function()
+		for action, key in pairs(KeybindDefaults) do Keybinds[action] = key end
+		refreshKeybinds()
+		bindDiveKey()
+	end)
+	refreshKeybinds()
 
 	stfReset.MouseButton1Click:Connect(function()
 		for key, val in pairs(SettingsDefaults) do
