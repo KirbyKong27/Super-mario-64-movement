@@ -20,6 +20,9 @@ local IDLE_VARIANT_DELAY = 6 -- seconds standing still before an idle variant pl
 -- Head camera mode (persists across respawns): 0 off, 1 emoting only, 2 not emoting, 3 always
 local HeadCam = { mode = 0 }
 
+-- Functions run on shutdown (used by the party system to remove highlights)
+local ShutdownHooks = {}
+
 
 -- globalConns live for the whole script; charConns are cleared on every respawn
 local globalConns = {}
@@ -2094,6 +2097,473 @@ do
 	end)
 	refreshKeybinds()
 
+	--==================================================================--
+	--// PARTY SYSTEM (client-side tabs, highlights, profile state) //--
+	--==================================================================--
+	local PARTY_SIZE = 4
+	local PARTY_COLORS = {
+		c3(0, 200, 255), c3(255, 80, 80), c3(80, 230, 120), c3(255, 220, 60),
+		c3(200, 120, 255), c3(255, 140, 40), c3(255, 255, 255), c3(255, 105, 180),
+	}
+	local partySlots = {} -- [1] = you (fixed), [2..4] = {player, color, highlight}
+	local partyTabs = {}
+	local partySelected = 1
+	local partyFar = 40 -- studs
+	local farOptions = {20, 40, 80, 150}
+	local farIndex = 2
+	local highlightAlways = false
+	local pickerTarget = nil
+
+	local thumbCache = {}
+	local function getThumb(userId)
+		if thumbCache[userId] == nil then
+			local ok, url = pcall(function()
+				return Players:GetUserThumbnailAsync(userId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size150x150)
+			end)
+			thumbCache[userId] = (ok and url) or ""
+		end
+		return thumbCache[userId]
+	end
+
+	-- Animation id -> readable name, built from the tables defined above
+	local ANIM_NAMES = {}
+	local function addNames(tbl, label)
+		for name, id in pairs(tbl) do ANIM_NAMES[id] = label .. ": " .. name end
+	end
+	addNames(IdleAnimations, "Idle")
+	addNames(IdleVariants, "Idle variant")
+	addNames(RunAnimations, "Run")
+	addNames(JumpAnimations, "Jump")
+	addNames(FallAnimations, "Fall")
+	addNames(CrouchAnimations, "Crouch")
+	addNames(WallSlideAnimations, "Wallslide")
+	addNames(DiveAnimations, "Dive")
+	addNames(R15_Animations, "Ability")
+	for _, e in ipairs(EMOTES) do
+		if e[2] then ANIM_NAMES[e[2]] = "Emote: " .. e[1] end
+		if e[3] then
+			for _, v in ipairs(e[3]) do ANIM_NAMES[v] = "Emote: " .. e[1] end
+		end
+	end
+
+	local function inParty(p)
+		for i = 2, PARTY_SIZE do
+			if partySlots[i] and partySlots[i].player == p then return true end
+		end
+		return false
+	end
+
+	-- Reads a player's humanoid state, speed, and currently playing animations
+	local function describeState(p)
+		local char = p.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		if not hum then return "Not loaded", "" end
+		local speed = 0
+		local root = char:FindFirstChild("HumanoidRootPart")
+		if root then
+			local v = root.AssemblyLinearVelocity
+			speed = math.floor(Vector3.new(v.X, 0, v.Z).Magnitude + 0.5)
+		end
+		local names = {}
+		local animator = hum:FindFirstChildOfClass("Animator")
+		if animator then
+			for _, t in ipairs(animator:GetPlayingAnimationTracks()) do
+				local ok, id = pcall(function() return t.Animation.AnimationId end)
+				if ok and id then table.insert(names, ANIM_NAMES[id] or id) end
+			end
+		end
+		return hum:GetState().Name .. " | speed " .. speed, table.concat(names, ", ")
+	end
+
+	-- Party panel
+	local pf = panel("PartyMenu", "PARTY", ud2(0, 340, 0, 520))
+
+	local tabRow = ins("Frame")
+	tabRow.Size = ud2(1, -20, 0, 72)
+	tabRow.Position = ud2(0, 10, 0, 42)
+	tabRow.BackgroundTransparency = 1
+	tabRow.Parent = pf
+	local rowLayout = ins("UIListLayout")
+	rowLayout.FillDirection = Enum.FillDirection.Horizontal
+	rowLayout.Padding = UDim.new(0, 5)
+	rowLayout.Parent = tabRow
+
+	for i = 1, PARTY_SIZE do
+		local t = ins("TextButton")
+		t.Size = ud2(0, 74, 1, 0)
+		t.BackgroundColor3 = c3(30, 30, 30)
+		t.Text = ""
+		t.AutoButtonColor = true
+		t.Parent = tabRow
+		corner(t, 6)
+		local stroke = ins("UIStroke")
+		stroke.Thickness = 1
+		stroke.Color = c3(70, 70, 70)
+		stroke.Parent = t
+		local av = ins("ImageLabel")
+		av.Size = ud2(0, 36, 0, 36)
+		av.Position = ud2(0.5, -18, 0, 4)
+		av.BackgroundTransparency = 1
+		av.Visible = false
+		av.Parent = t
+		corner(av, 18)
+		local nm = ins("TextLabel")
+		nm.Size = ud2(1, -6, 0, 16)
+		nm.Position = ud2(0, 3, 1, -18)
+		nm.BackgroundTransparency = 1
+		nm.Font = Enum.Font.GothamBold
+		nm.TextSize = 11
+		nm.TextColor3 = c3(220, 220, 220)
+		nm.TextTruncate = Enum.TextTruncate.AtEnd
+		nm.Text = ""
+		nm.Parent = t
+		local plus = ins("TextLabel")
+		plus.Size = ud2(1, 0, 1, 0)
+		plus.BackgroundTransparency = 1
+		plus.Text = "+ Add"
+		plus.Font = Enum.Font.GothamBold
+		plus.TextSize = 13
+		plus.TextColor3 = c3(150, 150, 150)
+		plus.Parent = t
+		partyTabs[i] = {button = t, stroke = stroke, avatar = av, name = nm, plus = plus}
+	end
+
+	local prof = ins("Frame")
+	prof.Size = ud2(1, -20, 0, 280)
+	prof.Position = ud2(0, 10, 0, 124)
+	prof.BackgroundTransparency = 1
+	prof.Parent = pf
+
+	local bigAv = ins("ImageLabel")
+	bigAv.Size = ud2(0, 96, 0, 96)
+	bigAv.Position = ud2(0.5, -48, 0, 0)
+	bigAv.BackgroundTransparency = 1
+	bigAv.Parent = prof
+	corner(bigAv, 48)
+
+	local profName = ins("TextLabel")
+	profName.Size = ud2(1, 0, 0, 22)
+	profName.Position = ud2(0, 0, 0, 102)
+	profName.BackgroundTransparency = 1
+	profName.Font = Enum.Font.GothamBold
+	profName.TextSize = 14
+	profName.TextColor3 = c3(255, 255, 255)
+	profName.TextXAlignment = Enum.TextXAlignment.Center
+	profName.Parent = prof
+
+	local profState = ins("TextLabel")
+	profState.Size = ud2(1, 0, 0, 22)
+	profState.Position = ud2(0, 0, 0, 126)
+	profState.BackgroundTransparency = 1
+	profState.Font = Enum.Font.Gotham
+	profState.TextSize = 13
+	profState.TextColor3 = c3(0, 200, 255)
+	profState.TextXAlignment = Enum.TextXAlignment.Center
+	profState.Parent = prof
+
+	local profAnim = ins("TextLabel")
+	profAnim.Size = ud2(1, 0, 0, 56)
+	profAnim.Position = ud2(0, 0, 0, 150)
+	profAnim.BackgroundTransparency = 1
+	profAnim.Font = Enum.Font.Gotham
+	profAnim.TextSize = 12
+	profAnim.TextWrapped = true
+	profAnim.TextColor3 = c3(190, 190, 210)
+	profAnim.TextXAlignment = Enum.TextXAlignment.Center
+	profAnim.TextYAlignment = Enum.TextYAlignment.Top
+	profAnim.Parent = prof
+
+	local swatchRow = ins("Frame")
+	swatchRow.Size = ud2(1, 0, 0, 22)
+	swatchRow.Position = ud2(0, 0, 0, 214)
+	swatchRow.BackgroundTransparency = 1
+	swatchRow.Parent = prof
+	local swLayout = ins("UIListLayout")
+	swLayout.FillDirection = Enum.FillDirection.Horizontal
+	swLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+	swLayout.Padding = UDim.new(0, 4)
+	swLayout.Parent = swatchRow
+
+	local removeBtn = ins("TextButton")
+	removeBtn.Size = ud2(0, 140, 0, 28)
+	removeBtn.Position = ud2(0.5, -70, 0, 246)
+	removeBtn.BackgroundColor3 = c3(150, 0, 0)
+	removeBtn.Text = "Remove from party"
+	removeBtn.TextColor3 = c3(255, 255, 255)
+	removeBtn.Font = Enum.Font.GothamBold
+	removeBtn.TextSize = 12
+	removeBtn.Parent = prof
+	corner(removeBtn, 4)
+
+	-- Dropdown of players in the server (opens when an empty tab is pressed)
+	local picker = ins("Frame")
+	picker.Size = ud2(1, -20, 0, 280)
+	picker.Position = ud2(0, 10, 0, 124)
+	picker.BackgroundColor3 = c3(22, 22, 22)
+	picker.BorderSizePixel = 0
+	picker.Visible = false
+	picker.Parent = pf
+	corner(picker, 6)
+
+	local pickTitle = ins("TextLabel")
+	pickTitle.Size = ud2(1, 0, 0, 26)
+	pickTitle.BackgroundTransparency = 1
+	pickTitle.Text = "Pick a player"
+	pickTitle.Font = Enum.Font.GothamBold
+	pickTitle.TextSize = 14
+	pickTitle.TextColor3 = c3(255, 255, 255)
+	pickTitle.Parent = picker
+
+	local pickList = ins("ScrollingFrame")
+	pickList.Size = ud2(1, -16, 1, -74)
+	pickList.Position = ud2(0, 8, 0, 30)
+	pickList.BackgroundTransparency = 1
+	pickList.CanvasSize = ud2(0, 0, 0, 0)
+	pickList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	pickList.ScrollBarThickness = 4
+	pickList.Parent = picker
+	local pickLayout = ins("UIListLayout")
+	pickLayout.Padding = UDim.new(0, 4)
+	pickLayout.Parent = pickList
+
+	local pickCancel = ins("TextButton")
+	pickCancel.Size = ud2(0, 120, 0, 28)
+	pickCancel.Position = ud2(0.5, -60, 1, -36)
+	pickCancel.BackgroundColor3 = c3(60, 60, 60)
+	pickCancel.Text = "Cancel"
+	pickCancel.TextColor3 = c3(255, 255, 255)
+	pickCancel.Font = Enum.Font.GothamBold
+	pickCancel.TextSize = 12
+	pickCancel.Parent = picker
+	corner(pickCancel, 4)
+
+	-- Footer options
+	local modeBtn = ins("TextButton")
+	modeBtn.Size = ud2(0, 150, 0, 28)
+	modeBtn.Position = ud2(0, 10, 1, -40)
+	modeBtn.BackgroundColor3 = c3(40, 80, 60)
+	modeBtn.Text = "Highlight: Far only"
+	modeBtn.TextColor3 = c3(255, 255, 255)
+	modeBtn.Font = Enum.Font.GothamBold
+	modeBtn.TextSize = 12
+	modeBtn.Parent = pf
+	corner(modeBtn, 4)
+
+	local farBtn = ins("TextButton")
+	farBtn.Size = ud2(0, 150, 0, 28)
+	farBtn.Position = ud2(1, -160, 1, -40)
+	farBtn.BackgroundColor3 = c3(40, 80, 60)
+	farBtn.Text = "Far distance: " .. partyFar
+	farBtn.TextColor3 = c3(255, 255, 255)
+	farBtn.Font = Enum.Font.GothamBold
+	farBtn.TextSize = 12
+	farBtn.Parent = pf
+	corner(farBtn, 4)
+
+	-- Highlights are outline-only (FillTransparency 1) and parented to the member's character
+	local function makeHighlight(slot)
+		if slot.highlight then slot.highlight:Destroy() end
+		local hl = ins("Highlight")
+		hl.Name = "PartyHighlight"
+		hl.FillTransparency = 1
+		hl.OutlineTransparency = 0
+		hl.OutlineColor = slot.color
+		hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+		hl.Enabled = false
+		slot.highlight = hl
+	end
+
+	local function clearSlot(i)
+		if i == 1 then return end
+		local slot = partySlots[i]
+		if slot and slot.highlight then slot.highlight:Destroy() end
+		partySlots[i] = nil
+	end
+
+	local function assignSlot(i, p)
+		clearSlot(i)
+		local slot = {player = p, color = PARTY_COLORS[i]}
+		partySlots[i] = slot
+		makeHighlight(slot)
+		partySelected = i
+	end
+
+	local function refreshParty()
+		for i = 1, PARTY_SIZE do
+			local t = partyTabs[i]
+			local slot = partySlots[i]
+			if slot then
+				t.avatar.Visible = true
+				t.avatar.Image = getThumb(slot.player.UserId)
+				t.name.Text = slot.player.DisplayName
+				t.plus.Visible = false
+				t.stroke.Color = slot.color
+			else
+				t.avatar.Visible = false
+				t.name.Text = ""
+				t.plus.Visible = true
+				t.stroke.Color = c3(70, 70, 70)
+			end
+			t.stroke.Thickness = (i == partySelected) and 3 or 1
+		end
+	end
+
+	local function refreshProfile()
+		local slot = partySlots[partySelected]
+		if not slot then
+			partySelected = 1
+			slot = partySlots[1]
+		end
+		local p = slot.player
+		bigAv.Image = getThumb(p.UserId)
+		profName.Text = p.DisplayName .. "  (@" .. p.Name .. ")"
+		local st, anims = describeState(p)
+		profState.Text = st
+		profAnim.Text = anims ~= "" and anims or "No animations playing"
+		swatchRow.Visible = not slot.isSelf
+		removeBtn.Visible = not slot.isSelf
+	end
+
+	local function openPicker(i)
+		pickerTarget = i
+		for _, c in ipairs(pickList:GetChildren()) do
+			if c:IsA("TextButton") or c:IsA("TextLabel") then c:Destroy() end
+		end
+		local count = 0
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p ~= plr and not inParty(p) then
+				count += 1
+				local b = ins("TextButton")
+				b.Size = ud2(1, -6, 0, 30)
+				b.BackgroundColor3 = c3(40, 40, 40)
+				b.Text = p.DisplayName .. "  (@" .. p.Name .. ")"
+				b.TextColor3 = c3(255, 255, 255)
+				b.Font = Enum.Font.Gotham
+				b.TextSize = 13
+				b.Parent = pickList
+				corner(b, 4)
+				b.MouseButton1Click:Connect(function()
+					assignSlot(pickerTarget, p)
+					picker.Visible = false
+					refreshParty()
+					refreshProfile()
+				end)
+			end
+		end
+		if count == 0 then
+			local e = ins("TextLabel")
+			e.Size = ud2(1, -6, 0, 30)
+			e.BackgroundTransparency = 1
+			e.Text = "No other players in this server"
+			e.TextColor3 = c3(150, 150, 150)
+			e.Font = Enum.Font.Gotham
+			e.TextSize = 12
+			e.Parent = pickList
+		end
+		picker.Visible = true
+	end
+
+	local function onTabClick(i)
+		if partySlots[i] then
+			partySelected = i
+			refreshParty()
+			refreshProfile()
+		else
+			openPicker(i)
+		end
+	end
+
+	-- Wiring
+	partySlots[1] = {player = plr, color = PARTY_COLORS[1], isSelf = true}
+	for i = 1, PARTY_SIZE do
+		partyTabs[i].button.MouseButton1Click:Connect(function() onTabClick(i) end)
+	end
+	pickCancel.MouseButton1Click:Connect(function() picker.Visible = false end)
+	removeBtn.MouseButton1Click:Connect(function()
+		clearSlot(partySelected)
+		partySelected = 1
+		refreshParty()
+		refreshProfile()
+	end)
+	for _, c in ipairs(PARTY_COLORS) do
+		local b = ins("TextButton")
+		b.Size = ud2(0, 18, 0, 18)
+		b.BackgroundColor3 = c
+		b.Text = ""
+		b.Parent = swatchRow
+		corner(b, 9)
+		b.MouseButton1Click:Connect(function()
+			local slot = partySlots[partySelected]
+			if slot and not slot.isSelf then
+				slot.color = c
+				if slot.highlight then slot.highlight.OutlineColor = c end
+				refreshParty()
+			end
+		end)
+	end
+	modeBtn.MouseButton1Click:Connect(function()
+		highlightAlways = not highlightAlways
+		modeBtn.Text = highlightAlways and "Highlight: Always" or "Highlight: Far only"
+	end)
+	farBtn.MouseButton1Click:Connect(function()
+		farIndex = farIndex % #farOptions + 1
+		partyFar = farOptions[farIndex]
+		farBtn.Text = "Far distance: " .. partyFar
+	end)
+
+	-- Party button in Settings
+	local partyBtn = ins("TextButton")
+	partyBtn.Size = ud2(1, 0, 0, 34)
+	partyBtn.BackgroundColor3 = c3(40, 80, 60)
+	partyBtn.Text = "Party"
+	partyBtn.TextColor3 = c3(255, 255, 255)
+	partyBtn.Font = Enum.Font.GothamBold
+	partyBtn.TextSize = 12
+	partyBtn.Parent = stContent
+	corner(partyBtn, 4)
+	partyBtn.MouseButton1Click:Connect(function() pf.Visible = not pf.Visible end)
+
+	refreshParty()
+	refreshProfile()
+
+	-- Keep highlights attached to each member's current character, and update visibility
+	local accum, profAccum = 0, 0
+	gconn(RunService.Heartbeat:Connect(function(dt)
+		accum += dt
+		if accum < 0.1 then return end
+		accum = 0
+		local myRoot = Cur.root
+		for i = 2, PARTY_SIZE do
+			local slot = partySlots[i]
+			if slot and slot.highlight then
+				local char = slot.player.Character
+				local root = char and char:FindFirstChild("HumanoidRootPart")
+				if char and slot.highlight.Parent ~= char then slot.highlight.Parent = char end
+				local dist = (myRoot and root) and (myRoot.Position - root.Position).Magnitude or 0
+				slot.highlight.Enabled = root ~= nil and (highlightAlways or dist >= partyFar)
+			end
+		end
+		if pf.Visible then
+			profAccum += 0.1
+			if profAccum >= 0.25 then
+				profAccum = 0
+				refreshProfile()
+			end
+		end
+	end))
+
+	gconn(Players.PlayerRemoving:Connect(function(p)
+		for i = 2, PARTY_SIZE do
+			if partySlots[i] and partySlots[i].player == p then clearSlot(i) end
+		end
+		refreshParty()
+		refreshProfile()
+	end))
+
+	table.insert(ShutdownHooks, function()
+		for i = 2, PARTY_SIZE do clearSlot(i) end
+	end)
+
 	stfReset.MouseButton1Click:Connect(function()
 		for key, val in pairs(SettingsDefaults) do
 			Settings[key] = val
@@ -2179,6 +2649,7 @@ local function shutdown()
 			h.JumpPower = 50
 		end
 	end)
+	for _, h in ipairs(ShutdownHooks) do pcall(h) end
 	cleanupCharacter()
 	for _, c in ipairs(globalConns) do pcall(function() c:Disconnect() end) end
 	table.clear(globalConns)
